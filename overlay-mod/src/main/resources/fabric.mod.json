@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "nebula-overlay",
+  "version": "0.1.0",
+  "name": "Nebula Overlay",
+  "description": "Optional Fabric companion for in-game Spotify controls and FPS samples. Talks to the launcher over localhost. Not an injector.",
+  "authors": ["Nebula"],
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.nebula.overlay.NebulaOverlayMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21"
+  }
+}
