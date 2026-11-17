@@ -30,6 +30,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            system::get_machine_id,
             system::get_system_info,
             jvm::list_java_runtimes,
             jvm::plan_jvm,

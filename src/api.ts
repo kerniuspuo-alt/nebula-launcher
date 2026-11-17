@@ -120,6 +120,7 @@ export type Schematic = {
 
 export const api = {
   system: () => invoke<SystemInfo>("get_system_info"),
+  machineId: () => invoke<string>("get_machine_id"),
   javas: () => invoke<JavaRuntime[]>("list_java_runtimes"),
   planJvm: (minecraftVersion: string) =>
     invoke<JvmPlan>("plan_jvm", { minecraftVersion }),

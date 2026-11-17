@@ -25,6 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
@@ -186,6 +187,19 @@ const TABS: { id: Tab; label: string; icon: typeof Box }[] = [
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
+const ALLOWED_MAC_MACHINE_IDS = [
+  "C948BAB9-A662-57D1-934A-BE7A10F40F37",
+];
+
+async function isMacUpdateAllowed(): Promise<boolean> {
+  try {
+    const machineId = await invoke<string>("get_machine_id");
+    return ALLOWED_MAC_MACHINE_IDS.includes(machineId);
+  } catch {
+    return false;
+  }
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>("library");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -336,15 +350,25 @@ export default function App() {
 
   useEffect(() => {
     if (import.meta.env.VITE_TAURI_UPDATER_ENABLED !== "true") return;
+
     let active = true;
-    check()
-      .then((update) => {
+
+    void (async () => {
+      try {
+        const allowed = await isMacUpdateAllowed();
+        if (!allowed) {
+          console.info("Skipping updater check for unapproved Mac machine.");
+          return;
+        }
+
+        const update = await check();
         if (active && update) setAvailableUpdate(update);
         else if (update) void update.close();
-      })
-      .catch((error: unknown) => {
+      } catch (error: unknown) {
         if (active) notify(`Could not check for launcher updates: ${String(error)}`);
-      });
+      }
+    })();
+
     return () => {
       active = false;
     };
@@ -914,6 +938,23 @@ function Library({
                 }}
               >
                 Install files
+              </button>
+              <button
+                className="px-5 py-3 rounded-2xl"
+                style={{ border: "1px solid rgba(255, 90, 90, 0.6)", color: "#ffd5d5" }}
+                disabled={downloadBusy}
+                onClick={async () => {
+                  if (!window.confirm(`Delete instance "${current.name}"? This removes its files from disk.`)) return;
+                  try {
+                    await api.deleteInstance(current.id);
+                    await onRefresh();
+                    notify(`Deleted instance "${current.name}"`);
+                  } catch (e) {
+                    notify(`Could not delete instance: ${String(e)}`);
+                  }
+                }}
+              >
+                Delete instance
               </button>
             </div>
           </>

@@ -13,6 +13,29 @@ pub struct SystemInfo {
 }
 
 #[tauri::command]
+pub fn get_machine_id() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("ioreg -rd1 -c IOPlatformExpertDevice | awk '/IOPlatformUUID/ {print $3}' | tr -d '\"'")
+            .output()
+            .map_err(|error| format!("Failed to read machine id: {error}"))?;
+
+        let uuid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if uuid.is_empty() {
+            return Err("Mac hardware UUID was empty".to_string());
+        }
+        Ok(uuid)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Machine ID lookup is only supported on macOS".to_string())
+    }
+}
+
+#[tauri::command]
 pub fn get_system_info() -> SystemInfo {
     let mut sys = System::new_all();
     sys.refresh_all();

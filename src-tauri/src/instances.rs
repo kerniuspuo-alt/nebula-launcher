@@ -122,6 +122,12 @@ pub fn delete_instance(app: AppHandle, id: String) -> Result<(), String> {
     let mut data = load(&app)?;
     data.instances.retain(|i| i.id != id);
     save(&app, &data)?;
+
+    let dir = paths::instances_dir(&app)?.join(&id);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("Failed to remove instance directory: {e}"))?;
+    }
+
     Ok(())
 }
 
