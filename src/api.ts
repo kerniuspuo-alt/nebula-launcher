@@ -99,6 +99,18 @@ export type PlaytimeSummary = {
   sessions: number;
 };
 
+export type DownloadProgress = {
+  downloadId: string;
+  fileId: string;
+  fileName: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  speedBytesPerSecond: number;
+  etaSeconds: number | null;
+  status: "queued" | "downloading" | "paused" | "completed" | "cancelled" | "failed";
+  error?: string | null;
+};
+
 export type Schematic = {
   title: string;
   prompt: string;
@@ -111,7 +123,8 @@ export const api = {
   javas: () => invoke<JavaRuntime[]>("list_java_runtimes"),
   planJvm: (minecraftVersion: string) =>
     invoke<JvmPlan>("plan_jvm", { minecraftVersion }),
-  downloadTemurin: (feature: number) => invoke<string>("download_temurin", { feature }),
+  downloadTemurin: (feature: number, downloadId: string) =>
+    invoke<string>("download_temurin", { feature, downloadId }),
   instances: () => invoke<Instance[]>("list_instances"),
   upsertInstance: (instance: Partial<Instance> & { name: string; minecraftVersion: string; loader: string; profile: string }) =>
     invoke<Instance>("upsert_instance", { instance }),
@@ -132,16 +145,16 @@ export const api = {
       loader,
       apiKey,
     }),
-  installCurseForgeFile: (instanceId: string, fileId: number, apiKey: string) =>
-    invoke<string>("install_curseforge_file", { instanceId, fileId, apiKey }),
+  installCurseForgeFile: (instanceId: string, fileId: number, apiKey: string, downloadId: string) =>
+    invoke<string>("install_curseforge_file", { instanceId, fileId, apiKey, downloadId }),
   modVersions: (projectId: string, minecraftVersion: string, loader: string) =>
     invoke<Array<{ id: string; version_number: string }>>("modrinth_versions", {
       projectId,
       minecraftVersion,
       loader,
     }),
-  downloadMod: (instanceId: string, versionId: string) =>
-    invoke<string>("download_modrinth_version", { instanceId, versionId }),
+  downloadMod: (instanceId: string, versionId: string, downloadId: string) =>
+    invoke<string>("download_modrinth_version", { instanceId, versionId, downloadId }),
   ping: (host: string, port?: number) => invoke<ServerStatus>("ping_server", { host, port }),
   servers: () => invoke<CuratedServer[]>("curated_servers"),
   startMsLogin: () => invoke<{
@@ -169,13 +182,18 @@ export const api = {
     invoke<{ output: string; files: number }>("mix_resource_packs", { packA, packB, output }),
   schematic: (prompt: string) => invoke<Schematic>("generate_schematic", { prompt }),
   playtime: () => invoke<PlaytimeSummary>("playtime_summary"),
-  install: (versionId: string) => invoke<string>("install_version", { versionId }),
-  installInstance: (instanceId: string) => invoke<string>("install_instance", { instanceId }),
-  launch: (instanceId: string, serverHost?: string, serverPort?: number) =>
+  install: (versionId: string, downloadId: string) => invoke<string>("install_version", { versionId, downloadId }),
+  installInstance: (instanceId: string, downloadId: string) =>
+    invoke<string>("install_instance", { instanceId, downloadId }),
+  pauseDownload: (downloadId: string) => invoke<void>("pause_download", { downloadId }),
+  resumeDownload: (downloadId: string) => invoke<void>("resume_download", { downloadId }),
+  cancelDownload: (downloadId: string) => invoke<void>("cancel_download", { downloadId }),
+  launch: (instanceId: string, serverHost: string | undefined, serverPort: number | undefined, downloadId: string) =>
     invoke<{ pid: number; command: string }>("launch_instance", {
       instanceId,
       serverHost: serverHost ?? null,
       serverPort: serverPort ?? null,
+      downloadId,
     }),
   spotifyAuthorizeUrl: (clientId: string) => invoke<string>("spotify_authorize_url", { clientId }),
   spotifyAccessToken: () => invoke<string>("spotify_access_token"),

@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish-tauri:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify release tag matches app version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const config = JSON.parse(fs.readFileSync('./src-tauri/tauri.conf.json', 'utf8'));
+            const version = config.version;
+            const tag = process.env.TAG_NAME;
+            if (tag !== 'v' + version) {
+              console.error('Tag ' + tag + ' must match app version v' + version);
+              process.exit(1);
+            }
+          "
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build, sign, and publish release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Nebula Launcher ${{ github.ref_name }}"
+          releaseBody: |
+            Download the installer for your platform below.
+            Signed updater metadata is also included as latest.json.
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }}
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+
+  publish-release:
+    needs: publish-tauri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish completed release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release edit "$TAG_NAME" --draft=false --repo "$GITHUB_REPOSITORY"

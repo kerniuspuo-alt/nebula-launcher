@@ -1,15 +1,79 @@
-use serde::Serialize;
 use futures_util::{stream, StreamExt};
+use serde::Serialize;
+use std::collections::HashMap;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::auth;
 use crate::instances;
 use crate::jvm;
 use crate::paths;
+
+#[derive(Default)]
+pub struct DownloadRegistry {
+    active: Mutex<HashMap<String, Arc<DownloadControl>>>,
+}
+
+pub(crate) struct DownloadControl {
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) paused: watch::Sender<bool>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DownloadContext {
+    pub(crate) id: String,
+    pub(crate) control: Arc<DownloadControl>,
+}
+
+impl DownloadRegistry {
+    pub(crate) fn start(&self, id: String) -> Result<DownloadContext, String> {
+        if id.is_empty() || id.len() > 128 {
+            return Err("Invalid download session id".into());
+        }
+        let (paused, _) = watch::channel(false);
+        let control = Arc::new(DownloadControl {
+            cancellation: CancellationToken::new(),
+            paused,
+        });
+        let mut active = self.active.lock().map_err(|error| error.to_string())?;
+        if !active.is_empty() {
+            return Err("Another installation is already active".into());
+        }
+        if active.contains_key(&id) {
+            return Err("A download with this id is already active".into());
+        }
+        active.insert(id.clone(), control.clone());
+        Ok(DownloadContext { id, control })
+    }
+
+    fn get(&self, id: &str) -> Result<Arc<DownloadControl>, String> {
+        self.active
+            .lock()
+            .map_err(|error| error.to_string())?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "Download session is no longer active".into())
+    }
+
+    pub(crate) fn finish(&self, context: &DownloadContext) {
+        if let Ok(mut active) = self.active.lock() {
+            if active
+                .get(&context.id)
+                .is_some_and(|control| Arc::ptr_eq(control, &context.control))
+            {
+                active.remove(&context.id);
+            }
+        }
+    }
+}
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -18,6 +82,20 @@ pub struct InstallProgress {
     pub current: u64,
     pub total: u64,
     pub detail: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgress {
+    download_id: String,
+    file_id: String,
+    file_name: String,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    speed_bytes_per_second: u64,
+    eta_seconds: Option<u64>,
+    status: String,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -39,11 +117,64 @@ fn emit(app: &AppHandle, stage: &str, current: u64, total: u64, detail: &str) {
     );
 }
 
-async fn download_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
-    download_file_with_client(&reqwest::Client::new(), url, dest).await
+pub(crate) fn emit_file_progress(
+    app: &AppHandle,
+    session: &DownloadContext,
+    file_id: &str,
+    file_name: &str,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    speed_bytes_per_second: u64,
+    status: &str,
+) {
+    let eta_seconds = (total_bytes > downloaded_bytes && speed_bytes_per_second > 0)
+        .then(|| (total_bytes - downloaded_bytes).div_ceil(speed_bytes_per_second));
+    let _ = app.emit(
+        "download-progress",
+        DownloadProgress {
+            download_id: session.id.clone(),
+            file_id: file_id.to_string(),
+            file_name: file_name.to_string(),
+            downloaded_bytes,
+            total_bytes,
+            speed_bytes_per_second,
+            eta_seconds,
+            status: status.to_string(),
+            error: None,
+        },
+    );
 }
 
-async fn download_file_with_client(
+pub(crate) fn emit_download_failure(
+    app: &AppHandle,
+    session: &DownloadContext,
+    file_name: &str,
+    error: &str,
+) {
+    let _ = app.emit(
+        "download-progress",
+        DownloadProgress {
+            download_id: session.id.clone(),
+            file_id: format!("{}:failure", session.id),
+            file_name: file_name.to_string(),
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            speed_bytes_per_second: 0,
+            eta_seconds: None,
+            status: if error.to_ascii_lowercase().contains("cancel") {
+                "cancelled"
+            } else {
+                "failed"
+            }
+            .to_string(),
+            error: Some(error.to_string()),
+        },
+    );
+}
+
+pub(crate) async fn download_file_with_client(
+    app: &AppHandle,
+    session: &DownloadContext,
     client: &reqwest::Client,
     url: &str,
     dest: &std::path::Path,
@@ -51,22 +182,279 @@ async fn download_file_with_client(
     if dest.exists() {
         return Ok(());
     }
+    if session.control.cancellation.is_cancelled() {
+        return Err("Download cancelled".into());
+    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let bytes = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?;
     let mut tmp = dest.to_path_buf();
     tmp.set_extension("part");
-    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
-    std::fs::rename(tmp, dest).map_err(|e| e.to_string())?;
-    Ok(())
+    let file_id = uuid::Uuid::new_v4().to_string();
+    let file_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download")
+        .to_string();
+    emit_file_progress(app, session, &file_id, &file_name, 0, 0, 0, "queued");
+    let result = async {
+        let mut paused = session.control.paused.subscribe();
+        let response = loop {
+            if *paused.borrow() {
+                emit_file_progress(app, session, &file_id, &file_name, 0, 0, 0, "paused");
+                while *paused.borrow() {
+                    tokio::select! {
+                        _ = session.control.cancellation.cancelled() => return Err("Download cancelled".to_string()),
+                        changed = paused.changed() => changed.map_err(|error| error.to_string())?,
+                    }
+                }
+            }
+            let response = tokio::select! {
+                _ = session.control.cancellation.cancelled() => return Err("Download cancelled".into()),
+                changed = paused.changed() => {
+                    changed.map_err(|error| error.to_string())?;
+                    continue;
+                }
+                response = client.get(url).send() => response.map_err(|error| error.to_string())?,
+            };
+            break response.error_for_status().map_err(|error| error.to_string())?;
+        };
+        let total_bytes = response.content_length().unwrap_or_default();
+        let mut stream = response.bytes_stream();
+        let mut file = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut active_segment_started = std::time::Instant::now();
+        let mut paused_elapsed = std::time::Duration::ZERO;
+        let mut last_update = active_segment_started;
+        let mut downloaded_bytes = 0u64;
+        let mut pause_started = false;
+        loop {
+            if *paused.borrow() && !pause_started {
+                paused_elapsed += active_segment_started.elapsed();
+                pause_started = true;
+                emit_file_progress(
+                    app, session, &file_id, &file_name, downloaded_bytes, total_bytes, 0, "paused",
+                );
+            }
+            while *paused.borrow() {
+                tokio::select! {
+                    _ = session.control.cancellation.cancelled() => return Err("Download cancelled".to_string()),
+                    changed = paused.changed() => changed.map_err(|error| error.to_string())?,
+                }
+            }
+            if pause_started {
+                active_segment_started = std::time::Instant::now();
+                pause_started = false;
+            }
+            let chunk = tokio::select! {
+                _ = session.control.cancellation.cancelled() => return Err("Download cancelled".into()),
+                changed = paused.changed() => {
+                    changed.map_err(|error| error.to_string())?;
+                    continue;
+                }
+                chunk = stream.next() => chunk,
+            };
+            let Some(chunk) = chunk else { break };
+            let chunk = chunk.map_err(|error| error.to_string())?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| error.to_string())?;
+            downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
+            let now = std::time::Instant::now();
+            if now.duration_since(last_update).as_millis() >= 100 || downloaded_bytes == total_bytes {
+                let elapsed = paused_elapsed + active_segment_started.elapsed();
+                let speed = (downloaded_bytes as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
+                emit_file_progress(
+                    app, session, &file_id, &file_name, downloaded_bytes, total_bytes, speed, "downloading",
+                );
+                last_update = now;
+            }
+        }
+        if session.control.cancellation.is_cancelled() {
+            return Err("Download cancelled".into());
+        }
+        file.flush().await.map_err(|error| error.to_string())?;
+        drop(file);
+        tokio::fs::rename(&tmp, dest)
+            .await
+            .map_err(|error| error.to_string())?;
+        let elapsed = paused_elapsed + active_segment_started.elapsed();
+        let speed = (downloaded_bytes as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
+        emit_file_progress(
+            app, session, &file_id, &file_name, downloaded_bytes, total_bytes, speed, "completed",
+        );
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        emit_file_progress(
+            app,
+            session,
+            &file_id,
+            &file_name,
+            0,
+            0,
+            0,
+            if result
+                .as_ref()
+                .is_err_and(|error| error == "Download cancelled")
+            {
+                "cancelled"
+            } else {
+                "failed"
+            },
+        );
+    }
+    result
+}
+
+pub(crate) async fn download_verified_file<D: sha2::Digest>(
+    app: &AppHandle,
+    session: &DownloadContext,
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    dest: &std::path::Path,
+    expected_hash: &str,
+    max_bytes: u64,
+) -> Result<(), String> {
+    let file_id = uuid::Uuid::new_v4().to_string();
+    let file_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download")
+        .to_string();
+    let mut tmp = dest.to_path_buf();
+    tmp.set_extension("part");
+    emit_file_progress(app, session, &file_id, &file_name, 0, 0, 0, "queued");
+
+    let result = async {
+        let mut paused = session.control.paused.subscribe();
+        let response = loop {
+            if *paused.borrow() {
+                emit_file_progress(app, session, &file_id, &file_name, 0, 0, 0, "paused");
+                while *paused.borrow() {
+                    tokio::select! {
+                        _ = session.control.cancellation.cancelled() => return Err("Download cancelled".to_string()),
+                        changed = paused.changed() => changed.map_err(|error| error.to_string())?,
+                    }
+                }
+            }
+            let response = tokio::select! {
+                _ = session.control.cancellation.cancelled() => return Err("Download cancelled".into()),
+                changed = paused.changed() => {
+                    changed.map_err(|error| error.to_string())?;
+                    continue;
+                }
+                response = client.get(url.clone()).send() => response.map_err(|error| error.to_string())?,
+            };
+            break response.error_for_status().map_err(|error| error.to_string())?;
+        };
+        let total_bytes = response.content_length().unwrap_or_default();
+        if total_bytes > max_bytes {
+            return Err("Mod file exceeds the 256 MiB download limit".into());
+        }
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let mut stream = response.bytes_stream();
+        let mut file = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut hasher = D::new();
+        let started = std::time::Instant::now();
+        let mut last_update = started;
+        let mut downloaded_bytes = 0u64;
+        let mut paused_elapsed = std::time::Duration::ZERO;
+        let mut segment_started = started;
+        let mut pause_started = false;
+        loop {
+            if *paused.borrow() && !pause_started {
+                paused_elapsed += segment_started.elapsed();
+                pause_started = true;
+                emit_file_progress(
+                    app, session, &file_id, &file_name, downloaded_bytes, total_bytes, 0, "paused",
+                );
+            }
+            while *paused.borrow() {
+                tokio::select! {
+                    _ = session.control.cancellation.cancelled() => return Err("Download cancelled".to_string()),
+                    changed = paused.changed() => changed.map_err(|error| error.to_string())?,
+                }
+            }
+            if pause_started {
+                segment_started = std::time::Instant::now();
+                pause_started = false;
+            }
+            let chunk = tokio::select! {
+                _ = session.control.cancellation.cancelled() => return Err("Download cancelled".into()),
+                changed = paused.changed() => {
+                    changed.map_err(|error| error.to_string())?;
+                    continue;
+                }
+                chunk = stream.next() => chunk,
+            };
+            let Some(chunk) = chunk else { break };
+            let chunk = chunk.map_err(|error| error.to_string())?;
+            downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
+            if downloaded_bytes > max_bytes {
+                return Err("Mod file exceeds the 256 MiB download limit".into());
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| error.to_string())?;
+            let now = std::time::Instant::now();
+            if now.duration_since(last_update).as_millis() >= 100 || downloaded_bytes == total_bytes {
+                let elapsed = paused_elapsed + segment_started.elapsed();
+                let speed = (downloaded_bytes as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
+                emit_file_progress(
+                    app, session, &file_id, &file_name, downloaded_bytes, total_bytes, speed, "downloading",
+                );
+                last_update = now;
+            }
+        }
+        if session.control.cancellation.is_cancelled() {
+            return Err("Download cancelled".into());
+        }
+        if !hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected_hash) {
+            return Err("Downloaded mod failed its integrity check".into());
+        }
+        file.flush().await.map_err(|error| error.to_string())?;
+        drop(file);
+        tokio::fs::rename(&tmp, dest)
+            .await
+            .map_err(|error| error.to_string())?;
+        let elapsed = paused_elapsed + segment_started.elapsed();
+        let speed = (downloaded_bytes as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
+        emit_file_progress(
+            app, session, &file_id, &file_name, downloaded_bytes, total_bytes, speed, "completed",
+        );
+        Ok(())
+    }
+    .await;
+    if let Err(error) = &result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        emit_download_failure(app, session, &file_name, error);
+    }
+    result
+}
+
+fn download_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+async fn download_file(
+    app: &AppHandle,
+    session: &DownloadContext,
+    url: &str,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    download_file_with_client(app, session, download_client(), url, dest).await
 }
 
 fn os_name() -> &'static str {
@@ -99,68 +487,114 @@ fn rules_allow(rules: &serde_json::Value) -> bool {
 }
 
 #[tauri::command]
-pub async fn install_version(app: AppHandle, version_id: String) -> Result<String, String> {
-    let json_path = paths::versions_dir(&app)?.join(&version_id).join(format!("{version_id}.json"));
+pub async fn install_version(
+    app: AppHandle,
+    registry: State<'_, DownloadRegistry>,
+    version_id: String,
+    download_id: String,
+) -> Result<String, String> {
+    let session = registry.start(download_id)?;
+    let result = install_version_inner(&app, &version_id, &session).await;
+    if result.is_ok() {
+        emit(&app, "done", 1, 1, "Ready");
+    }
+    registry.finish(&session);
+    result
+}
+
+async fn install_version_inner(
+    app: &AppHandle,
+    version_id: &str,
+    session: &DownloadContext,
+) -> Result<String, String> {
+    let json_path = paths::versions_dir(&app)?
+        .join(&version_id)
+        .join(format!("{version_id}.json"));
     let json = if json_path.exists() {
         paths::read_json(&json_path)?
     } else {
         emit(&app, "meta", 0, 1, "Fetching version JSON");
-        crate::minecraft::fetch_version_json(app.clone(), version_id.clone()).await?
+        crate::minecraft::fetch_version_json(app.clone(), version_id.to_string()).await?
     };
     let client = json
         .pointer("/downloads/client/url")
         .and_then(|u| u.as_str())
         .ok_or("Version JSON missing client download")?;
-    let jar = paths::versions_dir(&app)?.join(&version_id).join(format!("{version_id}.jar"));
+    let jar = paths::versions_dir(&app)?
+        .join(&version_id)
+        .join(format!("{version_id}.jar"));
     if !jar.exists() {
         emit(&app, "client", 0, 1, "Downloading client jar");
-        download_file(client, &jar).await?;
+        download_file(app, session, client, &jar).await?;
     }
 
-    let libs = json.get("libraries").and_then(|l| l.as_array()).cloned().unwrap_or_default();
-    let total = libs.len() as u64;
-    for (i, lib) in libs.iter().enumerate() {
+    let libs = json.get("libraries").and_then(serde_json::Value::as_array);
+    let nkey = match std::env::consts::OS {
+        "macos" if std::env::consts::ARCH == "aarch64" => "natives-macos-arm64",
+        "macos" => "natives-osx",
+        "windows" => "natives-windows",
+        _ => "natives-linux",
+    };
+    let mut pending_libraries = Vec::new();
+    for lib in libs.into_iter().flatten() {
         if let Some(rules) = lib.get("rules") {
             if !rules_allow(rules) {
                 continue;
             }
         }
-        if let Some(url) = lib.pointer("/downloads/artifact/url").and_then(|u| u.as_str()) {
+        if let Some(url) = lib
+            .pointer("/downloads/artifact/url")
+            .and_then(|u| u.as_str())
+        {
             let path = lib
                 .pointer("/downloads/artifact/path")
                 .and_then(|p| p.as_str())
                 .unwrap_or("lib.jar");
             let dest = paths::libraries_dir(&app)?.join(path);
-            emit(&app, "libraries", i as u64, total, path);
-            download_file(url, &dest).await?;
+            pending_libraries.push((path.to_string(), url.to_string(), dest));
         }
-        // natives
-        let nkey = match std::env::consts::OS {
-            "macos" => {
-                if std::env::consts::ARCH == "aarch64" {
-                    "natives-macos-arm64"
-                } else {
-                    "natives-osx"
-                }
-            }
-            "windows" => "natives-windows",
-            _ => "natives-linux",
-        };
         if let Some(natives) = lib.get("downloads").and_then(|d| d.get("classifiers")) {
             if let Some(art) = natives.get(nkey).or_else(|| {
-                if nkey.contains("macos") {
-                    natives.get("natives-macos").or_else(|| natives.get("natives-osx"))
+                if nkey.starts_with("natives-macos") {
+                    natives
+                        .get("natives-macos")
+                        .or_else(|| natives.get("natives-osx"))
                 } else {
                     None
                 }
             }) {
                 if let Some(url) = art.get("url").and_then(|u| u.as_str()) {
-                    let path = art.get("path").and_then(|p| p.as_str()).unwrap_or("natives.jar");
+                    let path = art
+                        .get("path")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("natives.jar");
                     let dest = paths::libraries_dir(&app)?.join(path);
-                    download_file(url, &dest).await?;
+                    pending_libraries.push((path.to_string(), url.to_string(), dest));
                 }
             }
         }
+    }
+    let library_total = pending_libraries.len() as u64;
+    let completed = Arc::new(AtomicU64::new(0));
+    let client = download_client().clone();
+    let app_handle = app.clone();
+    let downloads = stream::iter(pending_libraries.into_iter().map(|(path, url, dest)| {
+        let app = app_handle.clone();
+        let client = client.clone();
+        let completed = completed.clone();
+        let session = session.clone();
+        async move {
+            download_file_with_client(&app, &session, &client, &url, &dest).await?;
+            let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            emit(&app, "libraries", count, library_total, &path);
+            Ok::<(), String>(())
+        }
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+    for result in downloads {
+        result?;
     }
 
     if let Some(asset_index) = json.pointer("/assetIndex/url").and_then(|u| u.as_str()) {
@@ -168,7 +602,9 @@ pub async fn install_version(app: AppHandle, version_id: String) -> Result<Strin
             .pointer("/assetIndex/id")
             .and_then(|i| i.as_str())
             .unwrap_or("legacy");
-        let index_path = paths::assets_dir(&app)?.join("indexes").join(format!("{id}.json"));
+        let index_path = paths::assets_dir(&app)?
+            .join("indexes")
+            .join(format!("{id}.json"));
         let index: serde_json::Value = if index_path.exists() {
             paths::read_json(&index_path)?
         } else {
@@ -182,16 +618,18 @@ pub async fn install_version(app: AppHandle, version_id: String) -> Result<Strin
             paths::write_json(&index_path, &index)?;
             index
         };
-        let objects = index.get("objects").cloned().unwrap_or(serde_json::json!({}));
-        let map = objects.as_object().cloned().unwrap_or_default();
+        let map = index.get("objects").and_then(serde_json::Value::as_object);
         let mut missing_assets = Vec::new();
-        for (_name, obj) in map.iter() {
+        for obj in map.into_iter().flatten().map(|(_, object)| object) {
             let hash = obj.get("hash").and_then(|h| h.as_str()).unwrap_or("");
             if hash.len() < 2 {
                 continue;
             }
             let prefix = &hash[..2];
-            let dest = paths::assets_dir(&app)?.join("objects").join(prefix).join(hash);
+            let dest = paths::assets_dir(&app)?
+                .join("objects")
+                .join(prefix)
+                .join(hash);
             if dest.exists() {
                 continue;
             }
@@ -200,31 +638,39 @@ pub async fn install_version(app: AppHandle, version_id: String) -> Result<Strin
         }
         let pending_total = missing_assets.len() as u64;
         let completed = Arc::new(AtomicU64::new(0));
-        let client = reqwest::Client::new();
+        let client = download_client().clone();
         let app_handle = app.clone();
         let downloaded = stream::iter(missing_assets.into_iter().map(|(hash, url, dest)| {
             let app = app_handle.clone();
             let client = client.clone();
             let completed = completed.clone();
+            let session = session.clone();
             async move {
-                if let Err(error) = download_file_with_client(&client, &url, &dest).await {
-                    eprintln!("asset {hash}: {error}");
-                }
+                download_file_with_client(&app, &session, &client, &url, &dest).await?;
                 let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 if count % 25 == 0 || count == pending_total {
                     emit(&app, "assets", count, pending_total, &hash);
                 }
+                Ok::<(), String>(())
             }
         }))
         .buffer_unordered(12)
         .collect::<Vec<_>>()
         .await;
-        if !downloaded.is_empty() {
-            emit(&app, "assets", pending_total, pending_total, "Asset downloads complete");
+        for result in downloaded {
+            result?;
+        }
+        if pending_total > 0 {
+            emit(
+                &app,
+                "assets",
+                pending_total,
+                pending_total,
+                "Asset downloads complete",
+            );
         }
     }
 
-    emit(&app, "done", 1, 1, "Ready");
     Ok(jar.to_string_lossy().to_string())
 }
 
@@ -235,21 +681,30 @@ fn maven_artifact_path(coordinate: &str) -> Result<String, String> {
     }
     let parts = coordinate.split(':').collect::<Vec<_>>();
     if !(3..=4).contains(&parts.len())
-        || parts
-            .iter()
-            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-+".contains(&byte)))
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-+".contains(&byte))
+        })
     {
         return Err("Invalid Maven artifact coordinate".into());
     }
     let group = parts[0].replace('.', "/");
     let artifact = parts[1];
     let version = parts[2];
-    let classifier = parts.get(3).map(|value| format!("-{value}")).unwrap_or_default();
-    Ok(format!("{group}/{artifact}/{version}/{artifact}-{version}{classifier}.{extension}"))
+    let classifier = parts
+        .get(3)
+        .map(|value| format!("-{value}"))
+        .unwrap_or_default();
+    Ok(format!(
+        "{group}/{artifact}/{version}/{artifact}-{version}{classifier}.{extension}"
+    ))
 }
 
 async fn install_loader_profile(
     app: &AppHandle,
+    session: &DownloadContext,
     minecraft_version: &str,
     loader: &str,
     loader_version: Option<&str>,
@@ -278,10 +733,21 @@ async fn install_loader_profile(
             .map_err(|error| error.to_string())?;
         versions
             .iter()
-            .find(|entry| entry.pointer("/loader/stable").and_then(|stable| stable.as_bool()) == Some(true))
+            .find(|entry| {
+                entry
+                    .pointer("/loader/stable")
+                    .and_then(|stable| stable.as_bool())
+                    == Some(true)
+            })
             .or_else(|| versions.first())
-            .and_then(|entry| entry.pointer("/loader/version").and_then(|value| value.as_str()))
-            .ok_or_else(|| format!("No {loader} loader is available for Minecraft {minecraft_version}"))?
+            .and_then(|entry| {
+                entry
+                    .pointer("/loader/version")
+                    .and_then(|value| value.as_str())
+            })
+            .ok_or_else(|| {
+                format!("No {loader} loader is available for Minecraft {minecraft_version}")
+            })?
             .to_string()
     };
     if !loader_version
@@ -337,7 +803,10 @@ async fn install_loader_profile(
             .map(str::to_string)
             .map(Ok)
             .unwrap_or_else(|| maven_artifact_path(coordinate))?;
-        let url = if let Some(url) = library.pointer("/downloads/artifact/url").and_then(|url| url.as_str()) {
+        let url = if let Some(url) = library
+            .pointer("/downloads/artifact/url")
+            .and_then(|url| url.as_str())
+        {
             url.to_string()
         } else {
             let base = library
@@ -348,12 +817,22 @@ async fn install_loader_profile(
         };
         let parsed_url = reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
         if parsed_url.scheme() != "https"
-            || !matches!(parsed_url.host_str(), Some("maven.fabricmc.net" | "maven.quiltmc.org" | "libraries.minecraft.net" | "repo.maven.apache.org"))
+            || !matches!(
+                parsed_url.host_str(),
+                Some(
+                    "maven.fabricmc.net"
+                        | "maven.quiltmc.org"
+                        | "libraries.minecraft.net"
+                        | "repo.maven.apache.org"
+                )
+            )
         {
-            return Err(format!("{loader} library has an untrusted repository URL: {url}"));
+            return Err(format!(
+                "{loader} library has an untrusted repository URL: {url}"
+            ));
         }
         emit(app, "fabric-libraries", index as u64, total, coordinate);
-        download_file(&url, &paths::libraries_dir(app)?.join(path)).await?;
+        download_file(app, session, &url, &paths::libraries_dir(app)?.join(path)).await?;
     }
 
     let base_path = paths::versions_dir(app)?
@@ -367,7 +846,12 @@ async fn install_loader_profile(
         .unwrap_or_default();
     let existing = libraries
         .iter()
-        .filter_map(|library| library.get("name").and_then(|name| name.as_str()).map(str::to_string))
+        .filter_map(|library| {
+            library
+                .get("name")
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
+        })
         .collect::<std::collections::HashSet<_>>();
     libraries.extend(profile_libraries.into_iter().filter(|library| {
         library
@@ -443,7 +927,12 @@ fn compose_installer_profile(
         .unwrap_or_default();
     let mut names = libraries
         .iter()
-        .filter_map(|library| library.get("name").and_then(|name| name.as_str()).map(str::to_string))
+        .filter_map(|library| {
+            library
+                .get("name")
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
+        })
         .collect::<std::collections::HashSet<_>>();
     libraries.extend(profile_libraries.into_iter().filter(|library| {
         library
@@ -458,11 +947,17 @@ fn compose_installer_profile(
         base["mainClass"] = main_class.clone();
     }
     if let (Some(base_args), Some(profile_args)) = (
-        base.get_mut("arguments").and_then(|arguments| arguments.as_object_mut()),
-        profile.get("arguments").and_then(|arguments| arguments.as_object()),
+        base.get_mut("arguments")
+            .and_then(|arguments| arguments.as_object_mut()),
+        profile
+            .get("arguments")
+            .and_then(|arguments| arguments.as_object()),
     ) {
         for key in ["game", "jvm"] {
-            if let Some(extra) = profile_args.get(key).and_then(|arguments| arguments.as_array()) {
+            if let Some(extra) = profile_args
+                .get(key)
+                .and_then(|arguments| arguments.as_array())
+            {
                 base_args
                     .entry(key.to_string())
                     .or_insert_with(|| serde_json::Value::Array(Vec::new()))
@@ -474,14 +969,25 @@ fn compose_installer_profile(
     } else if let Some(profile_args) = profile.get("arguments") {
         base["arguments"] = profile_args.clone();
     }
-    if let Some(profile_args) = profile.get("minecraftArguments").and_then(|args| args.as_str()) {
-        let base_args = base.get("minecraftArguments").and_then(|args| args.as_str()).unwrap_or("");
-        base["minecraftArguments"] = serde_json::Value::String(format!("{base_args} {profile_args}").trim().to_string());
+    if let Some(profile_args) = profile
+        .get("minecraftArguments")
+        .and_then(|args| args.as_str())
+    {
+        let base_args = base
+            .get("minecraftArguments")
+            .and_then(|args| args.as_str())
+            .unwrap_or("");
+        base["minecraftArguments"] =
+            serde_json::Value::String(format!("{base_args} {profile_args}").trim().to_string());
     }
     Ok(base)
 }
 
-fn merge_installer_profile(app: &AppHandle, minecraft_version: &str, profile_id: &str) -> Result<(), String> {
+fn merge_installer_profile(
+    app: &AppHandle,
+    minecraft_version: &str,
+    profile_id: &str,
+) -> Result<(), String> {
     let profile_path = paths::versions_dir(app)?
         .join(profile_id)
         .join(format!("{profile_id}.json"));
@@ -496,6 +1002,7 @@ fn merge_installer_profile(app: &AppHandle, minecraft_version: &str, profile_id:
 
 async fn install_classic_loader(
     app: &AppHandle,
+    session: &DownloadContext,
     minecraft_version: &str,
     loader: &str,
     requested_version: Option<&str>,
@@ -531,8 +1038,9 @@ async fn install_classic_loader(
             .ok_or_else(|| format!("No Forge build available for Minecraft {minecraft_version}"))?
             .to_string()
     } else if loader == "neoforge" {
-        let line = neoforge_line(minecraft_version)
-            .ok_or_else(|| format!("No NeoForge releases available for Minecraft {minecraft_version}"))?;
+        let line = neoforge_line(minecraft_version).ok_or_else(|| {
+            format!("No NeoForge releases available for Minecraft {minecraft_version}")
+        })?;
         let metadata: serde_json::Value = client
             .get("https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge")
             .send()
@@ -554,7 +1062,9 @@ async fn install_classic_loader(
             .map(str::to_string)
             .collect::<Vec<_>>();
         versions.sort_by(|left, right| compare_loader_versions(left, right));
-        versions.pop().ok_or_else(|| format!("No NeoForge build available for Minecraft {minecraft_version}"))?
+        versions.pop().ok_or_else(|| {
+            format!("No NeoForge build available for Minecraft {minecraft_version}")
+        })?
     } else {
         return Err(format!("Unknown loader {loader}"));
     };
@@ -579,7 +1089,11 @@ async fn install_classic_loader(
         _ => return Err(format!("Unknown loader {loader}")),
     };
     let installer_url = reqwest::Url::parse(&installer_url).map_err(|error| error.to_string())?;
-    let expected_host = if loader == "forge" { "maven.minecraftforge.net" } else { "maven.neoforged.net" };
+    let expected_host = if loader == "forge" {
+        "maven.minecraftforge.net"
+    } else {
+        "maven.neoforged.net"
+    };
     if installer_url.scheme() != "https" || installer_url.host_str() != Some(expected_host) {
         return Err(format!("Unexpected {loader} installer host"));
     }
@@ -587,7 +1101,7 @@ async fn install_classic_loader(
     let installer_path = app_data
         .join("loader-installers")
         .join(format!("{loader}-{loader_version}-installer.jar"));
-    download_file(installer_url.as_str(), &installer_path).await?;
+    download_file(app, session, installer_url.as_str(), &installer_path).await?;
     let profile_path = paths::versions_dir(app)?
         .join(&profile_id)
         .join(format!("{profile_id}.json"));
@@ -612,75 +1126,165 @@ async fn install_classic_loader(
                 }),
             )?;
         }
-        let plan = jvm::plan_jvm(app.clone(), minecraft_version.to_string(), None);
+        let plan = jvm::plan_jvm(app.clone(), minecraft_version.to_string(), None).await;
         let java = plan
             .matched
-            .ok_or_else(|| format!("Forge-family installation requires Java {}+", plan.required_major))?
+            .ok_or_else(|| {
+                format!(
+                    "Forge-family installation requires Java {}+",
+                    plan.required_major
+                )
+            })?
             .path;
-        let output = Command::new(java)
+        let mut installer = Command::new(java);
+        installer
             .arg("-jar")
             .arg(&installer_path)
             .arg(installer_flag)
             .arg(&app_data)
             .current_dir(&app_data)
-            .output()
+            .kill_on_drop(true);
+        let child = installer
+            .spawn()
             .map_err(|error| format!("Could not start {loader} installer: {error}"))?;
+        let output = tokio::select! {
+            _ = session.control.cancellation.cancelled() => return Err("Installation cancelled".into()),
+            output = child.wait_with_output() => output
+                .map_err(|error| format!("Could not wait for {loader} installer: {error}"))?,
+        };
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("{loader} installer failed: {}", detail.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")));
+            return Err(format!(
+                "{loader} installer failed: {}",
+                detail
+                    .lines()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
         }
         if !profile_path.exists() {
-            return Err(format!("{loader} installer completed but did not create {profile_id}"));
+            return Err(format!(
+                "{loader} installer completed but did not create {profile_id}"
+            ));
         }
         merge_installer_profile(app, minecraft_version, &profile_id)?;
     }
-    emit(app, loader, 1, 1, &format!("{loader} {loader_version} installed"));
+    emit(
+        app,
+        loader,
+        1,
+        1,
+        &format!("{loader} {loader_version} installed"),
+    );
     Ok((loader_version, profile_id))
 }
 
 #[tauri::command]
-pub async fn install_instance(app: AppHandle, instance_id: String) -> Result<String, String> {
+pub async fn install_instance(
+    app: AppHandle,
+    registry: State<'_, DownloadRegistry>,
+    instance_id: String,
+    download_id: String,
+) -> Result<String, String> {
+    let session = registry.start(download_id)?;
+    let result = install_instance_inner(&app, &instance_id, &session).await;
+    registry.finish(&session);
+    result
+}
+
+async fn install_instance_inner(
+    app: &AppHandle,
+    instance_id: &str,
+    session: &DownloadContext,
+) -> Result<String, String> {
     let mut instance = instances::list_instances(app.clone())?
         .into_iter()
         .find(|instance| instance.id == instance_id)
         .ok_or("Instance not found")?;
     if !["vanilla", "fabric", "quilt", "forge", "neoforge"].contains(&instance.loader.as_str()) {
-        return Err(format!("The {} loader installer is not implemented yet.", instance.loader));
+        return Err(format!(
+            "The {} loader installer is not implemented yet.",
+            instance.loader
+        ));
     }
-    let base_jar = install_version(app.clone(), instance.minecraft_version.clone()).await?;
-    match instance.loader.as_str() {
+    let base_jar = install_version_inner(app, &instance.minecraft_version, session).await?;
+    let result = match instance.loader.as_str() {
         "vanilla" => Ok(base_jar),
         "fabric" | "quilt" => {
             let (loader_version, _) = install_loader_profile(
-                &app,
+                app,
+                session,
                 &instance.minecraft_version,
                 &instance.loader,
                 instance.loader_version.as_deref(),
             )
             .await?;
             instance.loader_version = Some(loader_version);
-            instances::upsert_instance(app, instance)?;
+            instances::upsert_instance(app.clone(), instance)?;
             Ok(base_jar)
         }
         "forge" | "neoforge" => {
             let (loader_version, _) = install_classic_loader(
-                &app,
+                app,
+                session,
                 &instance.minecraft_version,
                 &instance.loader,
                 instance.loader_version.as_deref(),
             )
             .await?;
             instance.loader_version = Some(loader_version);
-            instances::upsert_instance(app, instance)?;
+            instances::upsert_instance(app.clone(), instance)?;
             Ok(base_jar)
         }
         _ => unreachable!("loader validated before installation"),
+    };
+    if result.is_ok() {
+        emit(app, "done", 1, 1, "Installation complete");
     }
+    result
 }
 
-fn classpath(app: &AppHandle, json: &serde_json::Value, version_id: &str) -> Result<String, String> {
+#[tauri::command]
+pub fn pause_download(
+    registry: State<'_, DownloadRegistry>,
+    download_id: String,
+) -> Result<(), String> {
+    registry.get(&download_id)?.paused.send_replace(true);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn resume_download(
+    registry: State<'_, DownloadRegistry>,
+    download_id: String,
+) -> Result<(), String> {
+    registry.get(&download_id)?.paused.send_replace(false);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn cancel_download(
+    registry: State<'_, DownloadRegistry>,
+    download_id: String,
+) -> Result<(), String> {
+    registry.get(&download_id)?.cancellation.cancel();
+    Ok(())
+}
+
+fn classpath(
+    app: &AppHandle,
+    json: &serde_json::Value,
+    version_id: &str,
+) -> Result<String, String> {
     let mut entries = Vec::new();
-    let jar = paths::versions_dir(app)?.join(version_id).join(format!("{version_id}.jar"));
+    let jar = paths::versions_dir(app)?
+        .join(version_id)
+        .join(format!("{version_id}.jar"));
     entries.push(jar.to_string_lossy().to_string());
     if let Some(libs) = json.get("libraries").and_then(|l| l.as_array()) {
         for lib in libs {
@@ -699,7 +1303,12 @@ fn classpath(app: &AppHandle, json: &serde_json::Value, version_id: &str) -> Res
                         .and_then(|coordinate| maven_artifact_path(coordinate).ok())
                 });
             if let Some(path) = path {
-                entries.push(paths::libraries_dir(app)?.join(path).to_string_lossy().to_string());
+                entries.push(
+                    paths::libraries_dir(app)?
+                        .join(path)
+                        .to_string_lossy()
+                        .to_string(),
+                );
             }
         }
     }
@@ -707,7 +1316,11 @@ fn classpath(app: &AppHandle, json: &serde_json::Value, version_id: &str) -> Res
     Ok(entries.join(sep))
 }
 
-fn extract_natives(app: &AppHandle, json: &serde_json::Value, natives_dir: &std::path::Path) -> Result<(), String> {
+fn extract_natives(
+    app: &AppHandle,
+    json: &serde_json::Value,
+    natives_dir: &std::path::Path,
+) -> Result<(), String> {
     std::fs::create_dir_all(natives_dir).map_err(|e| e.to_string())?;
     let complete = natives_dir.join(".nebula-ready");
     if complete.exists() {
@@ -718,14 +1331,23 @@ fn extract_natives(app: &AppHandle, json: &serde_json::Value, natives_dir: &std:
     };
     for lib in libs {
         if let Some(classifiers) = lib.pointer("/downloads/classifiers") {
-            for key in ["natives-macos-arm64", "natives-macos", "natives-osx", "natives-windows", "natives-linux"] {
+            for key in [
+                "natives-macos-arm64",
+                "natives-macos",
+                "natives-osx",
+                "natives-windows",
+                "natives-linux",
+            ] {
                 if std::env::consts::OS == "macos" && !key.contains("mac") && key != "natives-osx" {
                     continue;
                 }
                 if std::env::consts::OS == "windows" && key != "natives-windows" {
                     continue;
                 }
-                if let Some(path) = classifiers.pointer(&format!("/{key}/path")).and_then(|p| p.as_str()) {
+                if let Some(path) = classifiers
+                    .pointer(&format!("/{key}/path"))
+                    .and_then(|p| p.as_str())
+                {
                     let zip_path = paths::libraries_dir(app)?.join(path);
                     if !zip_path.exists() {
                         continue;
@@ -744,9 +1366,11 @@ fn extract_natives(app: &AppHandle, json: &serde_json::Value, natives_dir: &std:
 }
 
 fn expand_argument(value: &str, variables: &std::collections::HashMap<&str, String>) -> String {
-    variables.iter().fold(value.to_string(), |value, (key, replacement)| {
-        value.replace(&format!("${{{key}}}"), replacement)
-    })
+    variables
+        .iter()
+        .fold(value.to_string(), |value, (key, replacement)| {
+            value.replace(&format!("${{{key}}}"), replacement)
+        })
 }
 
 fn append_version_arguments(
@@ -766,9 +1390,16 @@ fn append_version_arguments(
             continue;
         }
         match value.get("value") {
-            Some(serde_json::Value::String(argument)) => target.push(expand_argument(argument, variables)),
+            Some(serde_json::Value::String(argument)) => {
+                target.push(expand_argument(argument, variables))
+            }
             Some(serde_json::Value::Array(arguments)) => {
-                target.extend(arguments.iter().filter_map(|argument| argument.as_str()).map(|argument| expand_argument(argument, variables)));
+                target.extend(
+                    arguments
+                        .iter()
+                        .filter_map(|argument| argument.as_str())
+                        .map(|argument| expand_argument(argument, variables)),
+                );
             }
             _ => {}
         }
@@ -798,9 +1429,24 @@ fn game_arguments(
 #[tauri::command]
 pub async fn launch_instance(
     app: AppHandle,
+    registry: State<'_, DownloadRegistry>,
     instance_id: String,
     server_host: Option<String>,
     server_port: Option<u16>,
+    download_id: String,
+) -> Result<LaunchResult, String> {
+    let session = registry.start(download_id)?;
+    let result = launch_instance_inner(app, instance_id, server_host, server_port, &session).await;
+    registry.finish(&session);
+    result
+}
+
+async fn launch_instance_inner(
+    app: AppHandle,
+    instance_id: String,
+    server_host: Option<String>,
+    server_port: Option<u16>,
+    session: &DownloadContext,
 ) -> Result<LaunchResult, String> {
     let mut inst = instances::list_instances(app.clone())?
         .into_iter()
@@ -831,7 +1477,7 @@ pub async fn launch_instance(
     if account.access_token == "<redacted>" || account.access_token.is_empty() {
         return Err("Sign in with Microsoft first.".into());
     }
-    install_instance(app.clone(), inst.id.clone()).await?;
+    install_instance_inner(&app, &inst.id, session).await?;
     inst = instances::list_instances(app.clone())?
         .into_iter()
         .find(|instance| instance.id == instance_id)
@@ -840,22 +1486,33 @@ pub async fn launch_instance(
     let version_id = match inst.loader.as_str() {
         "vanilla" => base_version_id.clone(),
         "fabric" | "quilt" => {
-            let loader_version = inst.loader_version.as_deref().ok_or("Fabric version was not installed")?;
+            let loader_version = inst
+                .loader_version
+                .as_deref()
+                .ok_or("Fabric version was not installed")?;
             format!("{}-loader-{loader_version}-{base_version_id}", inst.loader)
         }
         "forge" => {
-            let loader_version = inst.loader_version.as_deref().ok_or("Forge version was not installed")?;
+            let loader_version = inst
+                .loader_version
+                .as_deref()
+                .ok_or("Forge version was not installed")?;
             format!("{base_version_id}-forge-{loader_version}")
         }
         "neoforge" => {
-            let loader_version = inst.loader_version.as_deref().ok_or("NeoForge version was not installed")?;
+            let loader_version = inst
+                .loader_version
+                .as_deref()
+                .ok_or("NeoForge version was not installed")?;
             format!("neoforge-{loader_version}")
         }
         loader => return Err(format!("The {loader} loader is not implemented yet.")),
     };
-    let json_path = paths::versions_dir(&app)?.join(&version_id).join(format!("{version_id}.json"));
+    let json_path = paths::versions_dir(&app)?
+        .join(&version_id)
+        .join(format!("{version_id}.json"));
     let json: serde_json::Value = paths::read_json(&json_path)?;
-    let plan = jvm::plan_jvm(app.clone(), base_version_id.clone(), None);
+    let plan = jvm::plan_jvm(app.clone(), base_version_id.clone(), None).await;
     let java = plan
         .matched
         .ok_or_else(|| {
@@ -891,9 +1548,21 @@ pub async fn launch_instance(
     variables.insert("clientid", account.client_id.clone());
     variables.insert("auth_xuid", String::new());
     variables.insert("user_type", "msa".into());
-    variables.insert("version_type", json.get("type").and_then(|value| value.as_str()).unwrap_or("release").into());
+    variables.insert(
+        "version_type",
+        json.get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("release")
+            .into(),
+    );
     variables.insert("user_properties", "{}".into());
-    variables.insert("auth_session", format!("token:{}:{}:{}", account.uuid, account.name, account.access_token));
+    variables.insert(
+        "auth_session",
+        format!(
+            "token:{}:{}:{}",
+            account.uuid, account.name, account.access_token
+        ),
+    );
     variables.insert("game_assets", asset_index);
     variables.insert("natives_directory", natives.to_string_lossy().to_string());
     variables.insert("launcher_name", "Nebula".into());
@@ -901,8 +1570,14 @@ pub async fn launch_instance(
     variables.insert("resolution_width", "854".into());
     variables.insert("resolution_height", "480".into());
     variables.insert("classpath", cp.clone());
-    variables.insert("classpath_separator", if cfg!(windows) { ";" } else { ":" }.into());
-    variables.insert("library_directory", paths::libraries_dir(&app)?.to_string_lossy().to_string());
+    variables.insert(
+        "classpath_separator",
+        if cfg!(windows) { ";" } else { ":" }.into(),
+    );
+    variables.insert(
+        "library_directory",
+        paths::libraries_dir(&app)?.to_string_lossy().to_string(),
+    );
 
     let mut args: Vec<String> = plan.flags;
     let jvm_arguments = json.pointer("/arguments/jvm");
@@ -931,10 +1606,25 @@ pub async fn launch_instance(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
+        cmd.as_std_mut().creation_flags(0x08000000);
     }
-    let child = cmd.spawn().map_err(|e| e.to_string())?;
-    let pid = child.id();
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let pid = child.id().ok_or("Could not read Minecraft process id")?;
+    let monitor_app = app.clone();
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) => {
+                let _ = monitor_app.emit("minecraft-process-exit", status.code());
+            }
+            Err(error) => eprintln!("Could not monitor Minecraft process exit: {error}"),
+        }
+    });
+    emit(&app, "done", 1, 1, "Minecraft launched");
+    if let Some(window) = app.get_webview_window("main") {
+        if let Err(error) = window.minimize() {
+            eprintln!("Could not minimize launcher after Minecraft launch: {error}");
+        }
+    }
     let _ = instances::touch_instance(app.clone(), inst.id.clone(), 0);
     let _ = crate::playtime::log_session(
         app,
@@ -1008,7 +1698,10 @@ mod tests {
         let json = serde_json::json!({
             "minecraftArguments": "--username ${auth_player_name} --demo"
         });
-        assert_eq!(game_arguments(&json, &variables), ["--username", "Alex", "--demo"]);
+        assert_eq!(
+            game_arguments(&json, &variables),
+            ["--username", "Alex", "--demo"]
+        );
     }
 
     #[test]
@@ -1042,9 +1735,15 @@ mod tests {
         let merged = compose_installer_profile(base, &profile, "1.21.1", "forge-profile").unwrap();
         assert_eq!(merged["id"], "forge-profile");
         assert_eq!(merged["inheritsFrom"], "1.21.1");
-        assert_eq!(merged["mainClass"], "cpw.mods.bootstraplauncher.BootstrapLauncher");
+        assert_eq!(
+            merged["mainClass"],
+            "cpw.mods.bootstraplauncher.BootstrapLauncher"
+        );
         assert_eq!(merged["libraries"].as_array().unwrap().len(), 2);
         assert_eq!(merged["arguments"]["game"].as_array().unwrap().len(), 4);
-        assert_eq!(merged["arguments"]["jvm"][0], "-DlibraryDirectory=${library_directory}");
+        assert_eq!(
+            merged["arguments"]["jvm"][0],
+            "-DlibraryDirectory=${library_directory}"
+        );
     }
 }

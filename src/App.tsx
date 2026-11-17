@@ -7,10 +7,12 @@ import {
   Command,
   Crosshair,
   Disc3,
+  Download,
   Globe,
   Lock,
   Music2,
   Package,
+  Pause,
   Play,
   Search,
   Settings,
@@ -20,6 +22,7 @@ import {
   Sparkles,
   User,
   Waves,
+  X,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -29,6 +32,7 @@ import {
   api,
   type Account,
   type CuratedServer,
+  type DownloadProgress,
   type Instance,
   type JvmPlan,
   type ModHit,
@@ -206,6 +210,12 @@ export default function App() {
   const [selected, setSelected] = useState<string>("");
   const [toast, setToast] = useState<string>("");
   const [progress, setProgress] = useState<string>("");
+  const [downloadFiles, setDownloadFiles] = useState<DownloadProgress[]>([]);
+  const [downloadStage, setDownloadStage] = useState<{ stage: string; current: number; total: number; detail: string } | null>(null);
+  const [activeDownloadId, setActiveDownloadId] = useState<string | null>(null);
+  const [downloadPaused, setDownloadPaused] = useState(false);
+  const [downloadsOpen, setDownloadsOpen] = useState(false);
+  const activeDownloadRef = useRef<string | null>(null);
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [updateProgress, setUpdateProgress] = useState("");
   const [installingUpdate, setInstallingUpdate] = useState(false);
@@ -269,10 +279,55 @@ export default function App() {
       setPinConfigured(hasPin);
       setLocked(hasPin);
     }).catch((error) => notify(`Could not check PIN lock: ${String(error)}`));
+    let active = true;
+    let unlistenInstall: (() => void) | undefined;
+    let unlistenDownload: (() => void) | undefined;
     listen<{ stage: string; detail: string; current: number; total: number }>("install-progress", (e) => {
       setProgress(`${e.payload.stage}: ${e.payload.detail} (${e.payload.current}/${e.payload.total})`);
-    }).catch(() => null);
+      setDownloadStage(e.payload);
+    }).then((unlisten) => {
+      if (active) unlistenInstall = unlisten;
+      else unlisten();
+    }).catch((error) => notify(`Could not subscribe to installation progress: ${String(error)}`));
+    listen<DownloadProgress>("download-progress", (e) => {
+      setDownloadFiles((current) => {
+        const index = current.findIndex((file) => file.fileId === e.payload.fileId);
+        const updated = [...current];
+        if (index >= 0) updated[index] = e.payload;
+        else updated.push(e.payload);
+        return updated.slice(-30);
+      });
+    }).then((unlisten) => {
+      if (active) unlistenDownload = unlisten;
+      else unlisten();
+    }).catch((error) => notify(`Could not subscribe to download progress: ${String(error)}`));
+    return () => {
+      active = false;
+      unlistenInstall?.();
+      unlistenDownload?.();
+    };
   }, []);
+
+  const startDownload = () => {
+    if (activeDownloadRef.current) {
+      notify("Wait for the current installation to finish or cancel it first.");
+      return null;
+    }
+    const id = crypto.randomUUID();
+    activeDownloadRef.current = id;
+    setActiveDownloadId(id);
+    setDownloadPaused(false);
+    setDownloadFiles([]);
+    setDownloadStage(null);
+    setDownloadsOpen(true);
+    return id;
+  };
+
+  const finishDownload = (id: string) => {
+    if (activeDownloadRef.current === id) activeDownloadRef.current = null;
+    setActiveDownloadId((current) => current === id ? null : current);
+    setDownloadPaused(false);
+  };
 
   const notify = (msg: string) => {
     setToast(msg);
@@ -454,6 +509,16 @@ export default function App() {
               <Waves size={14} /> Motion blur
               <input type="checkbox" checked={motionBlur} onChange={(e) => setMotionBlur(e.target.checked)} />
             </label>
+            <button
+              className="download-toggle"
+              onClick={() => setDownloadsOpen((open) => !open)}
+              aria-expanded={downloadsOpen}
+              aria-label="Toggle download manager"
+            >
+              <Download size={15} />
+              Downloads
+              {activeDownloadId && <span className="download-live-dot" />}
+            </button>
             {progress && <span className="text-xs truncate max-w-[280px]">{progress}</span>}
           </div>
         </header>
@@ -486,10 +551,29 @@ export default function App() {
               onRefresh={refreshInstances}
               notify={notify}
               setProgress={setProgress}
+              startDownload={startDownload}
+              finishDownload={finishDownload}
+              downloadBusy={activeDownloadId !== null}
             />
           )}
-          {tab === "mods" && <Mods instance={instances.find((item) => item.id === selected) ?? null} notify={notify} />}
-          {tab === "servers" && <Servers instanceId={selected} notify={notify} />}
+          {tab === "mods" && (
+            <Mods
+              instance={instances.find((item) => item.id === selected) ?? null}
+              notify={notify}
+              startDownload={startDownload}
+              finishDownload={finishDownload}
+              downloadBusy={activeDownloadId !== null}
+            />
+          )}
+          {tab === "servers" && (
+            <Servers
+              instanceId={selected}
+              notify={notify}
+              startDownload={startDownload}
+              finishDownload={finishDownload}
+              downloadBusy={activeDownloadId !== null}
+            />
+          )}
           {tab === "spotify" && <Spotify onEnergy={setAudio} notify={notify} />}
           {tab === "studio" && <Studio instanceId={selected} notify={notify} />}
           {tab === "profiler" && <Profiler instanceId={selected} sys={sys} />}
@@ -513,10 +597,133 @@ export default function App() {
               setAccount={setAccount}
               notify={notify}
               sys={sys}
+              startDownload={startDownload}
+              finishDownload={finishDownload}
+              downloadBusy={activeDownloadId !== null}
             />
           )}
         </section>
       </main>
+
+      {downloadsOpen && (
+        <aside className="download-drawer glass" aria-label="Download manager">
+          <div className="flex items-start gap-3">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2 font-semibold">
+                <Download size={16} style={{ color: "var(--accent)" }} />
+                Download manager
+              </div>
+              <div className="mt-1 truncate text-xs" style={{ color: "var(--muted)" }}>
+                {activeDownloadId ? downloadStage?.detail || "Preparing installation…" : "No active installation"}
+              </div>
+            </div>
+            {activeDownloadId && (
+              <>
+                <button
+                  className="download-control"
+                  aria-label={downloadPaused ? "Resume downloads" : "Pause downloads"}
+                  title={downloadPaused ? "Resume" : "Pause"}
+                  onClick={() => {
+                    const operation = downloadPaused
+                      ? api.resumeDownload(activeDownloadId)
+                      : api.pauseDownload(activeDownloadId);
+                    operation.then(() => {
+                      setDownloadPaused(!downloadPaused);
+                      setDownloadFiles((files) => files.map((file) => file.status === "completed"
+                        ? file
+                        : { ...file, status: downloadPaused ? "downloading" : "paused" }));
+                    })
+                      .catch((error) => notify(`Could not control download: ${String(error)}`));
+                  }}
+                >
+                  {downloadPaused ? <Play size={15} /> : <Pause size={15} />}
+                </button>
+                <button
+                  className="download-control download-cancel"
+                  aria-label="Cancel downloads"
+                  title="Cancel"
+                  onClick={() => {
+                    api.cancelDownload(activeDownloadId).then(() => {
+                      setDownloadFiles((files) => files.map((file) => file.status === "completed" ? file : { ...file, status: "cancelled" }));
+                      setActiveDownloadId(null);
+                      setDownloadPaused(false);
+                    }).catch((error) => notify(`Could not cancel download: ${String(error)}`));
+                  }}
+                >
+                  <X size={15} />
+                </button>
+              </>
+            )}
+            <button className="download-control" aria-label="Close download manager" onClick={() => setDownloadsOpen(false)}>
+              <X size={15} />
+            </button>
+          </div>
+          {downloadStage && (
+            <div className="mt-4">
+              <div className="flex justify-between text-xs">
+                <span>Installation · {downloadStage.stage}</span>
+                <span>
+                  {downloadStage.total > 0
+                    ? `${Math.min(100, Math.round(downloadStage.current / downloadStage.total * 100))}%`
+                    : "Working"}
+                </span>
+              </div>
+              <div className="download-track mt-2">
+                <div
+                  className="download-fill"
+                  style={{
+                    width: `${downloadStage.total > 0
+                      ? Math.min(100, downloadStage.current / downloadStage.total * 100)
+                      : activeDownloadId ? 8 : 100}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          <div className="download-list mt-4">
+            {downloadFiles.length === 0 ? (
+              <div className="py-6 text-center text-sm" style={{ color: "var(--muted)" }}>
+                File activity will appear here.
+              </div>
+            ) : downloadFiles.map((file) => {
+              const percent = file.totalBytes > 0
+                ? Math.min(100, Math.round(file.downloadedBytes / file.totalBytes * 100))
+                : file.status === "completed" ? 100 : 0;
+              const speed = file.speedBytesPerSecond > 0
+                ? `${(file.speedBytesPerSecond / 1024 / 1024).toFixed(1)} MB/s`
+                : file.status === "queued" ? "Queued" : "";
+              return (
+                <div className="download-file" key={file.fileId}>
+                  <div className="flex items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate text-sm" title={file.fileName}>{file.fileName}</span>
+                    <span className="shrink-0 text-xs" style={{ color: "var(--muted)" }}>
+                      {file.status === "completed"
+                        ? "Done"
+                        : file.status === "cancelled"
+                          ? "Cancelled"
+                          : file.status === "failed"
+                            ? "Failed"
+                            : `${percent}%`}
+                    </span>
+                  </div>
+                  <div className="download-track mt-2">
+                    <div className={`download-fill ${file.status === "completed" ? "is-complete" : ""}`} style={{ width: `${percent}%` }} />
+                  </div>
+                  <div className="mt-1 flex justify-between text-[11px]" style={{ color: "var(--muted)" }}>
+                    <span>{speed || file.status}</span>
+                    <span>
+                      {file.error ?? (file.totalBytes > 0
+                        ? `${(file.downloadedBytes / 1024 / 1024).toFixed(1)} / ${(file.totalBytes / 1024 / 1024).toFixed(1)} MB`
+                        : file.status === "completed" ? "Complete" : file.status === "failed" ? "Retry from the install action" : "Size unknown")}
+                      {file.etaSeconds !== null && file.status === "downloading" ? ` · ${file.etaSeconds}s left` : ""}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </aside>
+      )}
 
       {searchOpen && (
         <CommandPalette
@@ -557,6 +764,9 @@ function Library({
   onRefresh,
   notify,
   setProgress,
+  startDownload,
+  finishDownload,
+  downloadBusy,
 }: {
   instances: Instance[];
   selected: string;
@@ -564,6 +774,9 @@ function Library({
   onRefresh: () => Promise<void>;
   notify: (s: string) => void;
   setProgress: (s: string) => void;
+  startDownload: () => string | null;
+  finishDownload: (id: string) => void;
+  downloadBusy: boolean;
 }) {
   const [versions, setVersions] = useState<VersionInfo[]>([]);
   const [name, setName] = useState("New instance");
@@ -666,28 +879,37 @@ function Library({
                 className="px-5 py-3 rounded-2xl font-medium"
                 style={{ background: "var(--accent)", color: "#081018" }}
                 onClick={async () => {
+                  const downloadId = startDownload();
+                  if (!downloadId) return;
                   try {
                     setProgress("Installing / launching…");
-                    const r = await api.launch(current.id);
+                    const r = await api.launch(current.id, undefined, undefined, downloadId);
                     notify(`Launched pid ${r.pid}`);
                   } catch (e) {
-                    notify(String(e));
+                    if (!String(e).toLowerCase().includes("cancelled")) notify(String(e));
+                  } finally {
+                    finishDownload(downloadId);
                   }
                 }}
-                disabled={!(["vanilla", "fabric", "quilt", "forge", "neoforge"].includes(current.loader))}
+                disabled={downloadBusy || !(["vanilla", "fabric", "quilt", "forge", "neoforge"].includes(current.loader))}
               >
                 Play
               </button>
               <button
                 className="px-5 py-3 rounded-2xl"
                 style={{ border: "1px solid var(--stroke)" }}
+                disabled={downloadBusy}
                 onClick={async () => {
+                  const downloadId = startDownload();
+                  if (!downloadId) return;
                   try {
-                    await api.installInstance(current.id);
+                    await api.installInstance(current.id, downloadId);
                     await onRefresh();
                     notify(`${current.loader} files installed`);
                   } catch (e) {
-                    notify(String(e));
+                    if (!String(e).toLowerCase().includes("cancelled")) notify(String(e));
+                  } finally {
+                    finishDownload(downloadId);
                   }
                 }}
               >
@@ -898,45 +1120,110 @@ const MOD_CATALOG: Array<{ slug: string; name: string; loaders: string[] }> = [
   { slug: "betterf3", name: "BetterF3", loaders: ["fabric", "quilt", "forge", "neoforge"] },
 ];
 
-function Mods({ instance, notify }: { instance: Instance | null; notify: (message: string) => void }) {
+function Mods({
+  instance,
+  notify,
+  startDownload,
+  finishDownload,
+  downloadBusy,
+}: {
+  instance: Instance | null;
+  notify: (message: string) => void;
+  startDownload: () => string | null;
+  finishDownload: (id: string) => void;
+  downloadBusy: boolean;
+}) {
   const [q, setQ] = useState("sodium");
   const [source, setSource] = useState<"modrinth" | "curseforge">("modrinth");
   const [curseForgeKey, setCurseForgeKey] = useState("");
   const [hits, setHits] = useState<ModHit[]>([]);
+  const [versions, setVersions] = useState<VersionInfo[]>([]);
+  const [minecraftFilter, setMinecraftFilter] = useState(instance?.minecraftVersion ?? "");
+  const [loaderFilter, setLoaderFilter] = useState(
+    instance && ["fabric", "forge", "neoforge", "quilt"].includes(instance.loader) ? instance.loader : "fabric",
+  );
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
   const [scan, setScan] = useState<ScanFinding[]>([]);
   const [installing, setInstalling] = useState("");
   const [selectedMods, setSelectedMods] = useState<string[]>(MOD_CATALOG.map((mod) => mod.slug));
   const [batchProgress, setBatchProgress] = useState("");
   const compatibleMods = MOD_CATALOG.filter((mod) => instance && mod.loaders.includes(instance.loader));
-  const search = async () => {
-    if (source === "curseforge") {
-      if (!instance) throw new Error("Select a modded instance first");
-      if (!curseForgeKey.trim()) throw new Error("Enter a CurseForge API key");
-      const results = await api.searchCurseForgeMods(q, instance.minecraftVersion, instance.loader, curseForgeKey.trim());
-      setHits(results.map((hit) => ({
-        project_id: String(hit.id),
-        slug: hit.slug,
-        title: hit.name,
-        description: hit.summary,
-        downloads: hit.downloadCount,
-        icon_url: hit.logoUrl ?? undefined,
-      })));
-      return;
-    }
-    const res = await api.searchMods(q, JSON.stringify([["project_type:mod"]]));
-    setHits(res.hits ?? []);
-  };
+
   useEffect(() => {
-    search().catch(() => null);
+    api.versions()
+      .then((manifest) => setVersions(manifest.versions))
+      .catch((error) => notify(`Could not load Minecraft versions: ${String(error)}`));
   }, []);
+
+  useEffect(() => {
+    if (!instance) return;
+    setMinecraftFilter(instance.minecraftVersion);
+    if (["fabric", "forge", "neoforge", "quilt"].includes(instance.loader)) {
+      setLoaderFilter(instance.loader);
+    }
+  }, [instance?.id, instance?.minecraftVersion, instance?.loader]);
+
+  const search = async () => {
+    setSearching(true);
+    setSearchError("");
+    setHits([]);
+    try {
+      if (!minecraftFilter) throw new Error("Choose a Minecraft version");
+      if (!["fabric", "forge", "neoforge", "quilt"].includes(loaderFilter)) {
+        throw new Error("Choose Fabric, Forge, NeoForge, or Quilt");
+      }
+      if (source === "curseforge") {
+        if (!curseForgeKey.trim()) throw new Error("Enter a CurseForge API key");
+        const results = await api.searchCurseForgeMods(q, minecraftFilter, loaderFilter, curseForgeKey.trim());
+        setHits(results.map((hit) => ({
+          project_id: String(hit.id),
+          slug: hit.slug,
+          title: hit.name,
+          description: hit.summary,
+          downloads: hit.downloadCount,
+          icon_url: hit.logoUrl ?? undefined,
+        })));
+        return;
+      }
+      const facets = JSON.stringify([
+        [`versions:${minecraftFilter}`],
+        [`categories:${loaderFilter}`],
+        ["project_type:mod"],
+      ]);
+      const result = await api.searchMods(q, facets);
+      setHits(result.hits ?? []);
+    } catch (error) {
+      const message = String(error);
+      setSearchError(message);
+      throw error;
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!minecraftFilter) return;
+    search().catch(() => undefined);
+  }, [instance?.id, minecraftFilter, loaderFilter, source]);
+
+  const installTargetMatches = Boolean(instance)
+    && instance?.minecraftVersion === minecraftFilter
+    && instance?.loader === loaderFilter;
 
   const installSelectedMods = async () => {
     if (!instance || installing) return;
+    if (!installTargetMatches) {
+      notify("Select an instance matching the Minecraft version and loader filters before installing");
+      return;
+    }
     const selected = compatibleMods.filter((mod) => selectedMods.includes(mod.slug));
     if (selected.length === 0) {
       notify("Select at least one mod");
       return;
     }
+    const downloadId = startDownload();
+    if (!downloadId) return;
     setInstalling("batch");
     const installed: string[] = [];
     const skipped: string[] = [];
@@ -952,10 +1239,12 @@ function Mods({ instance, notify }: { instance: Instance | null; notify: (messag
             skipped.push(mod.name);
             continue;
           }
-          await api.downloadMod(instance.id, version.id);
+          await api.downloadMod(instance.id, version.id, downloadId);
           installed.push(mod.name);
         } catch (error) {
-          failed.push(`${mod.name}: ${String(error)}`);
+          const message = String(error);
+          failed.push(`${mod.name}: ${message}`);
+          if (message.toLowerCase().includes("cancel")) break;
         }
       }
       const findings = await api.scanMods(instance.id);
@@ -969,6 +1258,7 @@ function Mods({ instance, notify }: { instance: Instance | null; notify: (messag
       notify(String(error));
     } finally {
       setInstalling("");
+      finishDownload(downloadId);
     }
   };
 
@@ -982,7 +1272,7 @@ function Mods({ instance, notify }: { instance: Instance | null; notify: (messag
               {compatibleMods.length} mods matched to {instance ? `${instance.minecraftVersion} ${instance.loader}` : "the selected instance"}. Required dependencies install automatically.
             </div>
           </div>
-          <button className="px-4 py-2 rounded-xl" style={{ background: "var(--accent)", color: "#081018" }} disabled={!instance || !compatibleMods.length || !!installing} onClick={() => void installSelectedMods()}>
+          <button className="px-4 py-2 rounded-xl" style={{ background: "var(--accent)", color: "#081018" }} disabled={!instance || !compatibleMods.length || !!installing || downloadBusy} onClick={() => void installSelectedMods()}>
             {installing === "batch" ? "Installing…" : `Install ${selectedMods.filter((slug) => compatibleMods.some((mod) => mod.slug === slug)).length} selected`}
           </button>
         </div>
@@ -1001,16 +1291,44 @@ function Mods({ instance, notify }: { instance: Instance | null; notify: (messag
         {batchProgress && <p className="text-xs mt-3 whitespace-pre-wrap" style={{ color: "var(--muted)" }}>{batchProgress}</p>}
       </div>
       <div className="flex gap-2">
-        <input className="flex-1" value={q} onChange={(e) => setQ(e.target.value)} placeholder={`Search ${source === "modrinth" ? "Modrinth" : "CurseForge"}`} />
+        <input
+          className="min-w-0 flex-1"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") void search().catch((error) => notify(String(error)));
+          }}
+          placeholder={`Search ${source === "modrinth" ? "Modrinth" : "CurseForge"}`}
+          aria-label="Search mods"
+        />
+        <select
+          className="max-w-36"
+          value={minecraftFilter}
+          onChange={(event) => setMinecraftFilter(event.target.value)}
+          aria-label="Filter by Minecraft version"
+        >
+          {!minecraftFilter && <option value="">Minecraft version</option>}
+          {versions.map((version) => <option key={version.id} value={version.id}>{version.id}</option>)}
+        </select>
+        <select
+          className="max-w-36"
+          value={loaderFilter}
+          onChange={(event) => setLoaderFilter(event.target.value)}
+          aria-label="Filter by mod loader"
+        >
+          <option value="fabric">Fabric</option>
+          <option value="forge">Forge</option>
+          <option value="neoforge">NeoForge</option>
+          <option value="quilt">Quilt</option>
+        </select>
         <select className="max-w-40" value={source} onChange={(event) => {
           setSource(event.target.value as "modrinth" | "curseforge");
-          setHits([]);
         }}>
           <option value="modrinth">Modrinth</option>
           <option value="curseforge">CurseForge</option>
         </select>
-        <button className="px-4 rounded-xl" style={{ background: "var(--accent)", color: "#081018" }} onClick={() => search().catch((error) => notify(String(error)))}>
-          Search
+        <button className="px-4 rounded-xl" style={{ background: "var(--accent)", color: "#081018" }} disabled={searching} onClick={() => search().catch((error) => notify(String(error)))}>
+          {searching ? "Searching…" : "Search"}
         </button>
         <button
           className="px-4 rounded-xl flex items-center gap-2"
@@ -1027,6 +1345,15 @@ function Mods({ instance, notify }: { instance: Instance | null; notify: (messag
       {source === "curseforge" && (
         <input className="w-full mt-3" type="password" autoComplete="off" placeholder="CurseForge API key" value={curseForgeKey} onChange={(event) => setCurseForgeKey(event.target.value)} />
       )}
+      <div className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
+        Results filtered for Minecraft {minecraftFilter || "—"} · {loaderFilter}. Install target: {instance ? `${instance.name} (${instance.minecraftVersion} · ${instance.loader})` : "no instance selected"}.
+      </div>
+      {!installTargetMatches && (
+        <p className="mt-2 text-sm" style={{ color: "var(--danger)" }}>
+          To install these results, select an instance matching both filters.
+        </p>
+      )}
+      {searchError && <p className="mt-3 text-sm" role="alert" style={{ color: "var(--danger)" }}>{searchError}</p>}
       <div className="mt-4 grid gap-2">
         {hits.map((h) => (
           <div key={h.project_id} className="flex items-center gap-3 p-3 rounded-2xl" style={{ border: "1px solid var(--stroke)" }}>
@@ -1039,10 +1366,11 @@ function Mods({ instance, notify }: { instance: Instance | null; notify: (messag
             <button
               className="px-3 py-2 rounded-xl text-sm"
               style={{ background: "var(--accent)", color: "#081018" }}
-              disabled={!instance || installing !== ""}
+              disabled={!installTargetMatches || installing !== "" || downloadBusy}
               onClick={async () => {
                 if (!instance) return;
                 setInstalling(h.project_id);
+                let downloadId: string | null = null;
                 try {
                   let installedPath: string;
                   let installedVersion = "";
@@ -1055,7 +1383,9 @@ function Mods({ instance, notify }: { instance: Instance | null; notify: (messag
                       return;
                     }
                     installedVersion = file.fileName;
-                    installedPath = await api.installCurseForgeFile(instance.id, file.id, curseForgeKey.trim());
+                    downloadId = startDownload();
+                    if (!downloadId) return;
+                    installedPath = await api.installCurseForgeFile(instance.id, file.id, curseForgeKey.trim(), downloadId);
                   } else {
                     const versions = await api.modVersions(h.project_id, instance.minecraftVersion, instance.loader);
                     const version = versions[0];
@@ -1064,7 +1394,9 @@ function Mods({ instance, notify }: { instance: Instance | null; notify: (messag
                       return;
                     }
                     installedVersion = version.version_number;
-                    installedPath = await api.downloadMod(instance.id, version.id);
+                    downloadId = startDownload();
+                    if (!downloadId) return;
+                    installedPath = await api.downloadMod(instance.id, version.id, downloadId);
                   }
                   const findings = await api.scanMods(instance.id);
                   setScan(findings);
@@ -1073,8 +1405,9 @@ function Mods({ instance, notify }: { instance: Instance | null; notify: (messag
                     ? `${h.title} installed but flagged by the heuristic scan`
                     : `${h.title} ${installedVersion} installed and scanned`);
                 } catch (error) {
-                  notify(String(error));
+                  if (!String(error).toLowerCase().includes("cancel")) notify(String(error));
                 } finally {
+                  if (downloadId) finishDownload(downloadId);
                   setInstalling("");
                 }
               }}
@@ -1086,6 +1419,9 @@ function Mods({ instance, notify }: { instance: Instance | null; notify: (messag
             </a>
           </div>
         ))}
+        {!searching && !searchError && hits.length === 0 && (
+          <p className="py-5 text-center text-sm" style={{ color: "var(--muted)" }}>No compatible mods found. Try another search or filter.</p>
+        )}
       </div>
       {scan.length > 0 && (
         <div className="mt-6">
@@ -1108,7 +1444,19 @@ function serverKey(server: CuratedServer) {
   return `${server.host}:${server.port}`;
 }
 
-function Servers({ instanceId, notify }: { instanceId: string; notify: (s: string) => void }) {
+function Servers({
+  instanceId,
+  notify,
+  startDownload,
+  finishDownload,
+  downloadBusy,
+}: {
+  instanceId: string;
+  notify: (s: string) => void;
+  startDownload: () => string | null;
+  finishDownload: (id: string) => void;
+  downloadBusy: boolean;
+}) {
   const [list, setList] = useState<CuratedServer[]>([]);
   const [status, setStatus] = useState<Record<string, ServerStatus>>({});
   const [query, setQuery] = useState("");
@@ -1247,12 +1595,17 @@ function Servers({ instanceId, notify }: { instanceId: string; notify: (s: strin
               <button
                 className="px-3 py-2 rounded-xl text-sm"
                 style={{ background: "var(--accent)", color: "#081018" }}
+                disabled={downloadBusy}
                 onClick={async () => {
+                  const downloadId = startDownload();
+                  if (!downloadId) return;
                   try {
-                    await api.launch(instanceId, server.host, server.port);
+                    await api.launch(instanceId, server.host, server.port, downloadId);
                     notify(`Connecting to ${server.name}`);
                   } catch (error) {
-                    notify(String(error));
+                    if (!String(error).toLowerCase().includes("cancelled")) notify(String(error));
+                  } finally {
+                    finishDownload(downloadId);
                   }
                 }}
               >
@@ -1754,6 +2107,9 @@ function SettingsView({
   setAccount,
   notify,
   sys,
+  startDownload,
+  finishDownload,
+  downloadBusy,
 }: {
   theme: string;
   setTheme: (t: string) => void;
@@ -1772,15 +2128,24 @@ function SettingsView({
   setAccount: (a: Account | null) => void;
   notify: (s: string) => void;
   sys: SystemInfo | null;
+  startDownload: () => string | null;
+  finishDownload: (id: string) => void;
+  downloadBusy: boolean;
 }) {
   const [login, setLogin] = useState<string>("");
   const [pin, setPin] = useState("");
   const [currentPin, setCurrentPin] = useState("");
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [javaPath, setJavaPath] = useState("");
   const [themeName, setThemeName] = useState(localStorage.getItem("nebula-theme-name") || "My Nebula");
   useEffect(() => {
     api.accounts().then(setAccounts).catch(() => setAccounts([]));
   }, [account?.uuid]);
+  useEffect(() => {
+    api.javas()
+      .then((runtimes) => setJavaPath(runtimes.find((runtime) => runtime.major === 21)?.path ?? ""))
+      .catch((error) => notify(`Could not discover Java runtimes: ${String(error)}`));
+  }, []);
   const exportTheme = () => {
     const blob = new Blob([JSON.stringify({ schemaVersion: 1, name: themeName, theme, palette, motionBlur }, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
@@ -2045,18 +2410,37 @@ function SettingsView({
         <button
           className="mt-2 px-3 py-2 rounded-xl"
           style={{ border: "1px solid var(--stroke)" }}
+          disabled={downloadBusy}
           onClick={async () => {
+            const downloadId = startDownload();
+            if (!downloadId) return;
             try {
-              notify("Downloading Temurin 21…");
-              await api.downloadTemurin(21);
-              notify("Java 21 installed into launcher runtimes");
+              const path = await api.downloadTemurin(21, downloadId);
+              setJavaPath(path);
+              try {
+                const runtimes = await api.javas();
+                if (!runtimes.some((runtime) => runtime.path === path)) {
+                  throw new Error("the installed runtime was not found");
+                }
+              } catch (error) {
+                notify(`Java 21 installed at ${path}, but runtime discovery could not be refreshed: ${String(error)}`);
+                return;
+              }
+              notify(`Java 21 installed: ${path}`);
             } catch (e) {
-              notify(String(e));
+              if (!String(e).toLowerCase().includes("cancel")) notify(String(e));
+            } finally {
+              finishDownload(downloadId);
             }
           }}
         >
           Download Temurin 21 ({sys?.arch})
         </button>
+        {javaPath && (
+          <div className="mt-2 text-xs break-all" style={{ color: "var(--muted)" }}>
+            Java 21: {javaPath}
+          </div>
+        )}
       </div>
       <div>
         <div className="kicker">Companion QR</div>

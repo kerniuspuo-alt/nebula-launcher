@@ -1,7 +1,10 @@
+use futures_util::StreamExt;
 use serde::Serialize;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tauri::AppHandle;
+use tauri::State;
+use tokio::process::Command;
 
 use crate::paths;
 use crate::system::recommended_heap_mb;
@@ -46,8 +49,8 @@ pub fn parse_java_major(version_output: &str) -> u32 {
     }
 }
 
-fn probe_java(bin: &Path) -> Option<JavaRuntime> {
-    let output = Command::new(bin).arg("-version").output().ok()?;
+async fn probe_java(bin: &Path) -> Option<JavaRuntime> {
+    let output = Command::new(bin).arg("-version").output().await.ok()?;
     let text = {
         let mut s = String::from_utf8_lossy(&output.stderr).to_string();
         if s.trim().is_empty() {
@@ -134,15 +137,22 @@ fn common_java_bins(app: &AppHandle) -> Vec<PathBuf> {
 }
 
 #[tauri::command]
-pub fn list_java_runtimes(app: AppHandle) -> Vec<JavaRuntime> {
-    let mut found = Vec::new();
-    for bin in common_java_bins(&app) {
-        if let Some(rt) = probe_java(&bin) {
-            if !found.iter().any(|f: &JavaRuntime| f.path == rt.path) {
-                found.push(rt);
-            }
-        }
-    }
+pub async fn list_java_runtimes(app: AppHandle) -> Vec<JavaRuntime> {
+    let mut seen_paths = std::collections::HashSet::new();
+    let bins = common_java_bins(&app)
+        .into_iter()
+        .filter(|path| seen_paths.insert(path.clone()))
+        .collect::<Vec<_>>();
+    let mut found = futures_util::stream::iter(
+        bins.into_iter()
+            .map(|bin| async move { probe_java(&bin).await }),
+    )
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     found.sort_by(|a, b| b.major.cmp(&a.major));
     found
 }
@@ -168,7 +178,13 @@ fn parse_mc_tuple(v: &str) -> (u32, u32, u32) {
     }
     let parts: Vec<u32> = cleaned
         .split('.')
-        .filter_map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok())
+        .filter_map(|p| {
+            p.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
         .collect();
     (
         parts.first().copied().unwrap_or(1),
@@ -191,10 +207,7 @@ pub fn aikar_flags(heap_mb: u64, java_major: u32) -> Vec<String> {
         "-Dstderr.encoding=UTF-8".into(),
     ];
     if java_major >= 21 {
-        flags.extend([
-            "-XX:+UseZGC".into(),
-            "-XX:+ZGenerational".into(),
-        ]);
+        flags.extend(["-XX:+UseZGC".into(), "-XX:+ZGenerational".into()]);
     } else {
         flags.extend([
             "-XX:+UseG1GC".into(),
@@ -214,11 +227,16 @@ pub fn aikar_flags(heap_mb: u64, java_major: u32) -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn plan_jvm(app: AppHandle, minecraft_version: String, total_ram_mb: Option<u64>) -> JvmPlan {
+pub async fn plan_jvm(
+    app: AppHandle,
+    minecraft_version: String,
+    total_ram_mb: Option<u64>,
+) -> JvmPlan {
     let required = required_java_major(&minecraft_version);
     let ram = total_ram_mb.unwrap_or_else(|| crate::system::get_system_info().total_ram_mb);
     let heap = recommended_heap_mb(ram);
     let matched = list_java_runtimes(app)
+        .await
         .into_iter()
         .find(|rt| rt.major >= required);
     let rationale = format!(
@@ -270,45 +288,92 @@ pub fn adoptium_download_hint() -> AdoptiumHint {
 }
 
 #[tauri::command]
-pub async fn download_temurin(app: AppHandle, feature: u32) -> Result<String, String> {
+pub async fn download_temurin(
+    app: AppHandle,
+    registry: State<'_, crate::launch::DownloadRegistry>,
+    feature: u32,
+    download_id: String,
+) -> Result<String, String> {
+    let session = registry.start(download_id)?;
+    let result = download_temurin_inner(&app, feature, &session).await;
+    if let Err(error) = &result {
+        crate::launch::emit_download_failure(&app, &session, "Temurin Java runtime", error);
+    }
+    registry.finish(&session);
+    result
+}
+
+async fn download_temurin_inner(
+    app: &AppHandle,
+    feature: u32,
+    session: &crate::launch::DownloadContext,
+) -> Result<String, String> {
+    if !(8..=99).contains(&feature) {
+        return Err("Choose a supported Java feature version".into());
+    }
     let hint = adoptium_download_hint();
     let os = hint.os;
     let arch = hint.arch;
     let url = format!(
         "https://api.adoptium.net/v3/binary/latest/{feature}/ga/{os}/{arch}/jdk/hotspot/normal/eclipse?project=jdk"
     );
-    let dest_dir = paths::runtimes_dir(&app)?.join(format!("jdk-{feature}"));
-    std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+    let dest_dir = paths::runtimes_dir(app)?.join(format!("jdk-{feature}"));
+    tokio::fs::create_dir_all(&dest_dir)
+        .await
+        .map_err(|error| error.to_string())?;
     let archive_path = dest_dir.join("jdk-download.bin");
-    let bytes = reqwest::get(&url)
+    crate::launch::download_file_with_client(
+        app,
+        session,
+        crate::minecraft::shared_api_client(),
+        &url,
+        &archive_path,
+    )
+    .await?;
+    extract_archive(&archive_path, &dest_dir).await?;
+    let runtime = list_java_runtimes(app.clone())
         .await
-        .map_err(|e| e.to_string())?
-        .bytes()
+        .into_iter()
+        .find(|runtime| runtime.major == feature && Path::new(&runtime.path).starts_with(&dest_dir))
+        .ok_or_else(|| {
+            format!("Temurin Java {feature} downloaded but no usable runtime was found")
+        })?;
+    tokio::fs::remove_file(&archive_path)
         .await
-        .map_err(|e| e.to_string())?;
-    std::fs::write(&archive_path, &bytes).map_err(|e| e.to_string())?;
-    extract_archive(&archive_path, &dest_dir)?;
-    let _ = std::fs::remove_file(&archive_path);
-    Ok(dest_dir.to_string_lossy().to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(runtime.path)
 }
 
-fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+async fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
     let name = archive.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    let bytes = std::fs::read(archive).map_err(|e| e.to_string())?;
-    // Adoptium mac/win: .pkg/.msi sometimes, usually .tar.gz or .zip
-    if bytes.starts_with(b"PK") {
-        let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
-        let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-        zip.extract(dest).map_err(|e| e.to_string())?;
+    let mut magic = [0; 2];
+    std::fs::File::open(archive)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .map_err(|error| error.to_string())?;
+    if magic == *b"PK" {
+        let archive = archive.to_path_buf();
+        let dest = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(archive).map_err(|error| error.to_string())?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|error| error.to_string())?;
+            zip.extract(dest).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())??;
         return Ok(());
     }
-    // tar.gz — try `tar` which is present on macOS
     let status = Command::new("tar")
-        .args(["-xf", archive.to_str().unwrap_or(""), "-C", dest.to_str().unwrap_or(".")])
+        .args(["-xf"])
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
         .status()
-        .map_err(|e| e.to_string())?;
+        .await
+        .map_err(|error| error.to_string())?;
     if !status.success() {
-        return Err(format!("Could not extract Java archive ({name}). Install a JDK manually."));
+        return Err(format!(
+            "Could not extract Java archive ({name}). Install a JDK manually."
+        ));
     }
     Ok(())
 }

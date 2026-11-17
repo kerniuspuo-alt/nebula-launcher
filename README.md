@@ -7,9 +7,11 @@ It is inspired by Prism/Modrinth App UX and modern client polish. It does **not*
 ## What this first cut includes
 
 - Instance library, Mojang version manifest, library/asset install, JVM detect + Temurin download, Aikar/ZGC flags scaled to RAM
+- Native async JVM probing and game-process launch; server status checks run asynchronously and use a bounded in-memory cache
+- Live per-file install progress with transfer speed/ETA and native pause, resume, and cancel controls
 - Microsoft **device-code** login (Xbox Live → Minecraft services)
 - Curated public Java server browser with live status, player counts, MOTD, icons, search, version/game-mode/region filters, pagination, and Quick Connect (`--server`)
-- Modrinth and CurseForge search with Minecraft/loader-compatible versions, a 25-mod curated bulk installer, dependency-aware Modrinth install, and hash-verified JAR downloads
+- Modrinth and CurseForge search with Minecraft-version and loader filters, a 25-mod curated bulk installer, dependency-aware Modrinth install, and hash-verified JAR downloads
 - Local JAR **heuristic** scan (string matches only; not antivirus), with launch blocked when a scan flags a mod
 - Microsoft account switching/removal with token values redacted from frontend responses
 - Themes, motion-blur toggle, Cmd/Ctrl+K command search, playtime + world folder vault
@@ -30,7 +32,11 @@ It is inspired by Prism/Modrinth App UX and modern client polish. It does **not*
 | CurseForge API | Search and file install are wired; requires a CurseForge developer API key |
 | Mobile companion | Pairing string only |
 
-The JAR scanner uses a short list of suspicious strings and can produce false positives or miss threats. It is not a malware database or a substitute for trusted sources. Modrinth installs resolve required dependencies with a 32-version limit; optional dependencies are not installed automatically.
+The Mods tab filters search results by Minecraft version and mod loader. Installing a search result requires the selected instance to match both filters. Modrinth installs resolve required dependencies with a 32-version limit; optional dependencies are not installed automatically. CurseForge search and file install require the user's API key and do not resolve dependent files automatically.
+
+Minecraft installation, Modrinth/CurseForge JAR installs, and Temurin downloads use the native download manager. The drawer reports individual file transfer progress and stage progress; pausing, resuming, or cancelling affects the active transfer. Failed files show an error and can be retried from their install action. A successful Temurin download refreshes Java discovery and displays the installed executable path. Starting Minecraft minimizes the launcher window, but does not suspend its process or release its resident memory.
+
+The JAR scanner uses a short list of suspicious strings and can produce false positives or miss threats. It is not a malware database or a substitute for trusted sources.
 
 Fabric and Quilt instances use their official metadata APIs to select a loader build. Forge and NeoForge use their official installer artifacts in Nebula's managed app-data directory. These compose loader profiles over the Mojang game version. Custom modpack import is not implemented yet.
 
@@ -59,16 +65,15 @@ Register an Azure **public** client, Xbox Live sign-in, and Minecraft API. Accou
 
 ## Signed application updates
 
-Development builds use the existing Vite HMR setup through `npm run app:dev`. Production auto-updates are enabled only in release builds made with `npm run app:build:updater`; ordinary local builds do not check for updates or require signing credentials.
+Development builds use the existing Vite HMR setup through `npm run app:dev`. Production auto-updates are enabled only in updater-enabled release builds; ordinary local builds do not check for updates or require signing credentials. The updater checks the signed `latest.json` asset at `https://github.com/kerniuspuo-alt/nebula-launcher/releases/latest/download/latest.json`.
 
-Before creating updater releases:
+### Automated GitHub releases
 
-1. A local Tauri updater signing keypair is generated at `~/.tauri/nebula-launcher.key`; its public key is configured in `src-tauri/tauri.conf.json`. Keep the private key out of the repository; store it in release CI secrets when building releases elsewhere.
-2. Publish Tauri's signed `latest.json` manifest and platform update archives at an HTTPS endpoint.
-3. Replace the `https://updates.example.com/nebula/latest.json` placeholder in the ignored local `.env` or build environment with that HTTPS manifest URL. The placeholder in `tauri.conf.json` keeps the updater configuration explicit for normal builds; release builds reject it until a real URL is configured. `TAURI_SIGNING_PRIVATE_KEY` defaults to the local key path in `.env` and may be overridden in the environment. The private key environment variable may contain the key file path or key contents. Do not commit the private key or its contents.
-4. Run `npm run app:build:updater`. The release build verifies signed-version metadata, generates signed updater artifacts, and includes the endpoint and public key. When an update is found, the app offers **Restart and Update**.
+Push a `v<version>` tag matching `version` in `src-tauri/tauri.conf.json` (for example, `v0.1.0`). The workflow in `.github/workflows/release.yml` builds Windows x64 and macOS Intel/Apple Silicon bundles, signs updater artifacts, and publishes them with a signed `latest.json` manifest to a GitHub Release. The version check prevents a tag from publishing binaries whose embedded app version does not match the tag. A published release is available to the updater at the endpoint above.
 
-For GitHub Releases, the endpoint can be the repository's `releases/latest/download/latest.json` asset, provided the release workflow uploads the matching Tauri-generated archives, signatures, and manifest. This repository does not define a release repository or CI publishing workflow, so release hosting and secrets must be configured by the publisher. The endpoint remains empty until a real manifest is hosted; no dummy URL is configured because it would make update checks fail at runtime. Ordinary `npm run tauri build` does not require the endpoint or signing key. Never change the public key for an installed release unless publishing a migration build signed with the old key.
+Before pushing a release tag, add the repository Actions secret `TAURI_SIGNING_PRIVATE_KEY` containing the private key matching the public key in `src-tauri/tauri.conf.json`. If the key is password-protected, also add `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Never commit or print either secret. Keep the signing keypair stable for updates to already-installed releases; changing the configured public key requires a migration build signed with the old key.
+
+Local signed builds remain available through `npm run app:build:updater`; configure `TAURI_SIGNING_PRIVATE_KEY` and `NEBULA_UPDATER_ENDPOINT` in the build environment (or ignored local `.env`). Do not use a production signing key in untrusted builds.
 
 ## Legal / product bounds
 

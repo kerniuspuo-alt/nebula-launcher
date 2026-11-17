@@ -355,3 +355,99 @@ input:focus, select:focus, textarea:focus {
     transition-duration: 0.01ms !important;
   }
 }
+
+.download-toggle,
+.download-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--stroke);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--bg1) 76%, transparent);
+  color: var(--text);
+}
+
+.download-toggle {
+  position: relative;
+  flex: none;
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+.download-toggle:hover,
+.download-control:hover {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--stroke));
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg1));
+}
+
+.download-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent);
+}
+
+.download-drawer {
+  position: fixed;
+  z-index: 60;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  width: min(440px, calc(100vw - 32px));
+  max-height: min(68vh, 620px);
+  flex-direction: column;
+  padding: 16px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--bg1) 82%, transparent);
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+  box-shadow: 0 20px 70px rgba(0, 0, 0, 0.45);
+  animation: download-drawer-in 160ms ease-out;
+}
+
+.download-control {
+  width: 32px;
+  height: 32px;
+  flex: none;
+}
+
+.download-cancel:hover {
+  border-color: color-mix(in srgb, var(--danger) 65%, var(--stroke));
+  color: var(--danger);
+}
+
+.download-list {
+  min-height: 48px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.download-file {
+  padding: 10px 0;
+  border-top: 1px solid var(--stroke);
+}
+
+.download-track {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.download-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent2), var(--accent));
+  transition: width 120ms linear;
+}
+
+.download-fill.is-complete {
+  background: var(--ok);
+}
+
+@keyframes download-drawer-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}

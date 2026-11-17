@@ -15,6 +15,7 @@ mod system;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(launch::DownloadRegistry::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -72,6 +73,9 @@ pub fn run() {
             launch::install_version,
             launch::install_instance,
             launch::launch_instance,
+            launch::pause_download,
+            launch::resume_download,
+            launch::cancel_download,
             launch::save_crosshair_png,
             spotify::spotify_authorize_url,
             spotify::spotify_access_token,

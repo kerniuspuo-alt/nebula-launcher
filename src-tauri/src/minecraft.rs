@@ -1,11 +1,60 @@
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use sha1::Sha1;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::AppHandle;
+use tauri::State;
 
 use crate::paths;
 
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+
+pub(crate) fn shared_api_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+fn modrinth_cache() -> &'static Mutex<HashMap<String, (serde_json::Value, Instant)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (serde_json::Value, Instant)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn modrinth_json(url: &str) -> Result<serde_json::Value, String> {
+    {
+        let cache = modrinth_cache().lock().map_err(|error| error.to_string())?;
+        if let Some((value, created)) = cache.get(url) {
+            if created.elapsed() < Duration::from_secs(600) {
+                return Ok(value.clone());
+            }
+        }
+    }
+
+    let value: serde_json::Value = shared_api_client()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "nebula-launcher/0.1")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
+        .json()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut cache = modrinth_cache().lock().map_err(|error| error.to_string())?;
+    cache.retain(|_, (_, created)| created.elapsed() < Duration::from_secs(600));
+    if cache.len() >= 128 {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (_, created))| *created)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(url.to_string(), (value.clone(), Instant::now()));
+    Ok(value)
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VersionInfo {
@@ -33,13 +82,27 @@ pub struct VersionManifest {
 
 #[tauri::command]
 pub async fn fetch_version_manifest(app: AppHandle) -> Result<VersionManifest, String> {
-    let manifest: VersionManifest = reqwest::get(MANIFEST_URL)
+    let cache = paths::meta_dir(&app)?.join("version_manifest.json");
+    if cache.exists()
+        && cache
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+            .map_err(|error| error.to_string())?
+            < Duration::from_secs(3600)
+    {
+        return paths::read_json(&cache);
+    }
+    let manifest: VersionManifest = shared_api_client()
+        .get(MANIFEST_URL)
+        .send()
         .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
         .map_err(|e| e.to_string())?
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let cache = paths::meta_dir(&app)?.join("version_manifest.json");
     paths::write_json(&cache, &manifest)?;
     Ok(manifest)
 }
@@ -52,13 +115,19 @@ pub async fn fetch_version_json(app: AppHandle, id: String) -> Result<serde_json
         .iter()
         .find(|v| v.id == id)
         .ok_or_else(|| format!("Unknown version {id}"))?;
-    let json: serde_json::Value = reqwest::get(&info.url)
+    let json: serde_json::Value = shared_api_client()
+        .get(&info.url)
+        .send()
         .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
         .map_err(|e| e.to_string())?
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let path = paths::versions_dir(&app)?.join(&id).join(format!("{id}.json"));
+    let path = paths::versions_dir(&app)?
+        .join(&id)
+        .join(format!("{id}.json"));
     paths::write_json(&path, &json)?;
     Ok(json)
 }
@@ -119,24 +188,16 @@ pub fn performance_profiles() -> Vec<PerformanceProfile> {
 }
 
 #[tauri::command]
-pub async fn search_modrinth(query: String, facets: Option<String>) -> Result<serde_json::Value, String> {
+pub async fn search_modrinth(
+    query: String,
+    facets: Option<String>,
+) -> Result<serde_json::Value, String> {
     let q = urlencoding::encode(&query);
     let mut url = format!("https://api.modrinth.com/v2/search?limit=20&query={q}");
     if let Some(f) = facets {
         url.push_str(&format!("&facets={}", urlencoding::encode(&f)));
     }
-    let client = reqwest::Client::builder()
-        .user_agent("nebula-launcher/0.1 (legitimate launcher)")
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+    modrinth_json(&url).await
 }
 
 #[tauri::command]
@@ -163,20 +224,7 @@ pub async fn modrinth_versions(
     let url = format!(
         "https://api.modrinth.com/v2/project/{project_id}/version?game_versions={game_versions}&loaders={loaders}"
     );
-    let client = reqwest::Client::builder()
-        .user_agent("nebula-launcher/0.1")
-        .build()
-        .map_err(|e| e.to_string())?;
-    client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+    serde_json::from_value(modrinth_json(&url).await?).map_err(|error| error.to_string())
 }
 
 fn curseforge_loader_type(loader: &str) -> Result<u8, String> {
@@ -200,20 +248,17 @@ pub struct CurseForgeHit {
     logo_url: Option<String>,
 }
 
-fn curseforge_client(api_key: &str) -> Result<reqwest::Client, String> {
+fn validate_curseforge_key(api_key: &str) -> Result<(), String> {
     let api_key = api_key.trim();
-    if api_key.len() < 20 || api_key.len() > 128 || !api_key.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte)) {
+    if api_key.len() < 20
+        || api_key.len() > 128
+        || !api_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+    {
         return Err("Enter a valid CurseForge API key".into());
     }
-    reqwest::Client::builder()
-        .user_agent("Nebula-Launcher/0.1")
-        .default_headers({
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert("x-api-key", reqwest::header::HeaderValue::from_str(api_key).map_err(|error| error.to_string())?);
-            headers
-        })
-        .build()
-        .map_err(|error| error.to_string())
+    Ok(())
 }
 
 #[tauri::command]
@@ -224,9 +269,11 @@ pub async fn search_curseforge_mods(
     api_key: String,
 ) -> Result<Vec<CurseForgeHit>, String> {
     let loader_type = curseforge_loader_type(&loader)?;
-    let client = curseforge_client(&api_key)?;
-    let result: serde_json::Value = client
+    validate_curseforge_key(&api_key)?;
+    let result: serde_json::Value = shared_api_client()
         .get("https://api.curseforge.com/v1/mods/search")
+        .header(reqwest::header::USER_AGENT, "Nebula-Launcher/0.1")
+        .header("x-api-key", api_key.trim())
         .query(&[
             ("gameId", "432"),
             ("classId", "6"),
@@ -256,10 +303,24 @@ pub async fn search_curseforge_mods(
             Some(CurseForgeHit {
                 id: hit.get("id")?.as_u64()?,
                 name: hit.get("name")?.as_str()?.to_string(),
-                slug: hit.get("slug").and_then(|value| value.as_str()).unwrap_or_default().to_string(),
-                summary: hit.get("summary").and_then(|value| value.as_str()).unwrap_or_default().to_string(),
-                download_count: hit.get("downloadCount").and_then(|value| value.as_u64()).unwrap_or_default(),
-                logo_url: hit.pointer("/logo/url").and_then(|value| value.as_str()).map(str::to_string),
+                slug: hit
+                    .get("slug")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                summary: hit
+                    .get("summary")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                download_count: hit
+                    .get("downloadCount")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or_default(),
+                logo_url: hit
+                    .pointer("/logo/url")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
             })
         })
         .collect())
@@ -280,9 +341,11 @@ pub async fn curseforge_mod_files(
     api_key: String,
 ) -> Result<Vec<CurseForgeFile>, String> {
     let loader_type = curseforge_loader_type(&loader)?;
-    let client = curseforge_client(&api_key)?;
-    let result: serde_json::Value = client
+    validate_curseforge_key(&api_key)?;
+    let result: serde_json::Value = shared_api_client()
         .get(format!("https://api.curseforge.com/v1/mods/{mod_id}/files"))
+        .header(reqwest::header::USER_AGENT, "Nebula-Launcher/0.1")
+        .header("x-api-key", api_key.trim())
         .query(&[
             ("gameVersion", minecraft_version.as_str()),
             ("modLoaderType", loader_type.to_string().as_str()),
@@ -315,17 +378,40 @@ pub async fn curseforge_mod_files(
 #[tauri::command]
 pub async fn install_curseforge_file(
     app: AppHandle,
+    registry: State<'_, crate::launch::DownloadRegistry>,
     instance_id: String,
     file_id: u64,
     api_key: String,
+    download_id: String,
+) -> Result<String, String> {
+    let session = registry.start(download_id)?;
+    let result =
+        install_curseforge_file_inner(&app, &instance_id, file_id, &api_key, &session).await;
+    if let Err(error) = &result {
+        crate::launch::emit_download_failure(&app, &session, "CurseForge mod", error);
+    }
+    registry.finish(&session);
+    result
+}
+
+async fn install_curseforge_file_inner(
+    app: &AppHandle,
+    instance_id: &str,
+    file_id: u64,
+    api_key: &str,
+    session: &crate::launch::DownloadContext,
 ) -> Result<String, String> {
     let instance = crate::instances::list_instances(app.clone())?
         .into_iter()
         .find(|instance| instance.id == instance_id)
         .ok_or("Instance not found")?;
-    let client = curseforge_client(&api_key)?;
-    let result: serde_json::Value = client
-        .get(format!("https://api.curseforge.com/v1/mods/files/{file_id}"))
+    validate_curseforge_key(api_key)?;
+    let result: serde_json::Value = shared_api_client()
+        .get(format!(
+            "https://api.curseforge.com/v1/mods/files/{file_id}"
+        ))
+        .header(reqwest::header::USER_AGENT, "Nebula-Launcher/0.1")
+        .header("x-api-key", api_key.trim())
         .send()
         .await
         .map_err(|error| error.to_string())?
@@ -334,61 +420,90 @@ pub async fn install_curseforge_file(
         .json()
         .await
         .map_err(|error| error.to_string())?;
-    let file = result.get("data").ok_or("CurseForge file metadata is missing")?;
+    let file = result
+        .get("data")
+        .ok_or("CurseForge file metadata is missing")?;
     let compatible = file
         .get("gameVersions")
         .and_then(|versions| versions.as_array())
-        .is_some_and(|versions| versions.iter().any(|version| version.as_str() == Some(&instance.minecraft_version)));
+        .is_some_and(|versions| {
+            versions
+                .iter()
+                .any(|version| version.as_str() == Some(&instance.minecraft_version))
+        });
     if !compatible {
         return Err("CurseForge file does not match this Minecraft version".into());
     }
-    let filename = file.get("fileName").and_then(|name| name.as_str()).ok_or("CurseForge file has no filename")?;
+    let filename = file
+        .get("fileName")
+        .and_then(|name| name.as_str())
+        .ok_or("CurseForge file has no filename")?;
     let safe_name = std::path::Path::new(filename)
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| *name == filename && name.to_ascii_lowercase().ends_with(".jar"))
         .ok_or("CurseForge returned an invalid JAR filename")?;
-    let download_url = file.get("downloadUrl").and_then(|url| url.as_str()).ok_or("CurseForge file has no download URL")?;
+    let download_url = file
+        .get("downloadUrl")
+        .and_then(|url| url.as_str())
+        .ok_or("CurseForge file has no download URL")?;
     let url = reqwest::Url::parse(download_url).map_err(|error| error.to_string())?;
-    if url.scheme() != "https" || !url.host_str().is_some_and(|host| host.ends_with(".forgecdn.net")) {
+    if url.scheme() != "https"
+        || !url
+            .host_str()
+            .is_some_and(|host| host.ends_with(".forgecdn.net"))
+    {
         return Err("CurseForge returned an unexpected download host".into());
     }
     let expected_sha1 = file
         .get("hashes")
         .and_then(|hashes| hashes.as_array())
-        .and_then(|hashes| hashes.iter().find(|hash| hash.get("algo").and_then(|algo| algo.as_u64()) == Some(1)))
+        .and_then(|hashes| {
+            hashes
+                .iter()
+                .find(|hash| hash.get("algo").and_then(|algo| algo.as_u64()) == Some(1))
+        })
         .and_then(|hash| hash.get("value").and_then(|value| value.as_str()))
         .ok_or("CurseForge did not provide a SHA-1 integrity hash")?;
-    let response = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
-    if response.content_length().is_some_and(|length| length > 256 * 1024 * 1024) {
-        return Err("Mod file exceeds the 256 MiB download limit".into());
-    }
-    let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-    if bytes.len() > 256 * 1024 * 1024 {
-        return Err("Mod file exceeds the 256 MiB download limit".into());
-    }
-    if !hex::encode(Sha1::digest(&bytes)).eq_ignore_ascii_case(expected_sha1) {
-        return Err("Downloaded CurseForge mod failed its SHA-1 integrity check".into());
-    }
-    let dest = crate::paths::instances_dir(&app)?.join(instance_id).join("mods").join(safe_name);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    std::fs::write(&dest, bytes).map_err(|error| error.to_string())?;
+    let dest = crate::paths::instances_dir(app)?
+        .join(instance_id)
+        .join("mods")
+        .join(safe_name);
+    crate::launch::download_verified_file::<Sha1>(
+        app,
+        session,
+        shared_api_client(),
+        url,
+        &dest,
+        expected_sha1,
+        256 * 1024 * 1024,
+    )
+    .await?;
     Ok(dest.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 pub async fn download_modrinth_version(
     app: AppHandle,
+    registry: State<'_, crate::launch::DownloadRegistry>,
     instance_id: String,
     version_id: String,
+    download_id: String,
+) -> Result<String, String> {
+    let session = registry.start(download_id)?;
+    let result = download_modrinth_version_inner(&app, &instance_id, &version_id, &session).await;
+    if let Err(error) = &result {
+        crate::launch::emit_download_failure(&app, &session, "Modrinth mod", error);
+    }
+    registry.finish(&session);
+    result
+}
+
+async fn download_modrinth_version_inner(
+    app: &AppHandle,
+    instance_id: &str,
+    version_id: &str,
+    session: &crate::launch::DownloadContext,
 ) -> Result<String, String> {
     if !valid_modrinth_id(&version_id) {
         return Err("Invalid Modrinth version id".into());
@@ -401,11 +516,8 @@ pub async fn download_modrinth_version(
     if !["fabric", "forge", "neoforge", "quilt"].contains(&instance.loader.as_str()) {
         return Err("Select a modded instance before installing mods".into());
     }
-    let client = reqwest::Client::builder()
-        .user_agent("nebula-launcher/0.1")
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut pending = vec![(version_id.clone(), false)];
+    let client = shared_api_client();
+    let mut pending = vec![(version_id.to_string(), false)];
     let mut scheduled = std::collections::HashSet::new();
     let mut versions = std::collections::HashMap::new();
     let mut install_order = Vec::new();
@@ -422,42 +534,50 @@ pub async fn download_modrinth_version(
             return Err("Mod dependency graph exceeds the 32-version install limit".into());
         }
         let version_url = format!("https://api.modrinth.com/v2/version/{current_id}");
-        let json: serde_json::Value = client
-            .get(version_url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())?;
+        let json = modrinth_json(&version_url).await?;
         let game_matches = json
             .get("game_versions")
             .and_then(|versions| versions.as_array())
-            .is_some_and(|versions| versions.iter().any(|version| version.as_str() == Some(&instance.minecraft_version)));
+            .is_some_and(|versions| {
+                versions
+                    .iter()
+                    .any(|version| version.as_str() == Some(&instance.minecraft_version))
+            });
         let loader_matches = json
             .get("loaders")
             .and_then(|loaders| loaders.as_array())
-            .is_some_and(|loaders| loaders.iter().any(|loader| loader.as_str() == Some(&instance.loader)));
+            .is_some_and(|loaders| {
+                loaders
+                    .iter()
+                    .any(|loader| loader.as_str() == Some(&instance.loader))
+            });
         if !game_matches || !loader_matches {
-            return Err(format!("Modrinth version {current_id} is incompatible with this instance"));
+            return Err(format!(
+                "Modrinth version {current_id} is incompatible with this instance"
+            ));
         }
 
         let mut dependencies = Vec::new();
         if let Some(items) = json.get("dependencies").and_then(|items| items.as_array()) {
             for dependency in items {
-                if dependency.get("dependency_type").and_then(|kind| kind.as_str()) != Some("required") {
+                if dependency
+                    .get("dependency_type")
+                    .and_then(|kind| kind.as_str())
+                    != Some("required")
+                {
                     continue;
                 }
-                let dependency_id = if let Some(id) = dependency.get("version_id").and_then(|id| id.as_str()) {
+                let dependency_id = if let Some(id) =
+                    dependency.get("version_id").and_then(|id| id.as_str())
+                {
                     id.to_string()
-                } else if let Some(project_id) = dependency.get("project_id").and_then(|id| id.as_str()) {
+                } else if let Some(project_id) =
+                    dependency.get("project_id").and_then(|id| id.as_str())
+                {
                     if !valid_modrinth_id(project_id) {
                         return Err("Modrinth returned an invalid dependency project id".into());
                     }
                     compatible_project_version(
-                        &client,
                         project_id,
                         &instance.minecraft_version,
                         &instance.loader,
@@ -486,7 +606,7 @@ pub async fn download_modrinth_version(
         let json = versions
             .remove(&install_id)
             .ok_or("Missing resolved Modrinth version metadata")?;
-        let path = download_modrinth_file(&client, &app, &instance_id, &json).await?;
+        let path = download_modrinth_file(&client, app, instance_id, &json, session).await?;
         if install_id == version_id {
             root_path = Some(path);
         }
@@ -516,7 +636,6 @@ fn valid_modrinth_id(value: &str) -> bool {
 }
 
 async fn compatible_project_version(
-    client: &reqwest::Client,
     project_id: &str,
     minecraft_version: &str,
     loader: &str,
@@ -528,16 +647,8 @@ async fn compatible_project_version(
     let url = format!(
         "https://api.modrinth.com/v2/project/{project_id}/version?game_versions={game_versions}&loaders={loaders}"
     );
-    let versions: Vec<serde_json::Value> = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let versions: Vec<serde_json::Value> =
+        serde_json::from_value(modrinth_json(&url).await?).map_err(|error| error.to_string())?;
     versions
         .first()
         .and_then(|version| version.get("id"))
@@ -551,13 +662,26 @@ async fn download_modrinth_file(
     app: &AppHandle,
     instance_id: &str,
     json: &serde_json::Value,
+    session: &crate::launch::DownloadContext,
 ) -> Result<String, String> {
     let file = json
         .get("files")
         .and_then(|files| files.as_array())
-        .and_then(|files| files.iter().find(|file| file.get("primary").and_then(|primary| primary.as_bool()).unwrap_or(false)).or(files.first()))
+        .and_then(|files| {
+            files
+                .iter()
+                .find(|file| {
+                    file.get("primary")
+                        .and_then(|primary| primary.as_bool())
+                        .unwrap_or(false)
+                })
+                .or(files.first())
+        })
         .ok_or("No file on Modrinth version")?;
-    let dl = file.get("url").and_then(|url| url.as_str()).ok_or("Missing file url")?;
+    let dl = file
+        .get("url")
+        .and_then(|url| url.as_str())
+        .ok_or("Missing file url")?;
     let download_url = reqwest::Url::parse(dl).map_err(|e| e.to_string())?;
     if download_url.scheme() != "https" || download_url.host_str() != Some("cdn.modrinth.com") {
         return Err("Modrinth returned an unexpected file host".into());
@@ -575,26 +699,19 @@ async fn download_modrinth_file(
         .pointer("/hashes/sha512")
         .and_then(|hash| hash.as_str())
         .ok_or("Modrinth did not provide a SHA-512 hash")?;
-    let response = client.get(download_url).send().await.map_err(|e| e.to_string())?;
-    let response = response.error_for_status().map_err(|e| e.to_string())?;
-    if response.content_length().is_some_and(|length| length > 256 * 1024 * 1024) {
-        return Err("Mod file exceeds the 256 MiB download limit".into());
-    }
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() > 256 * 1024 * 1024 {
-        return Err("Mod file exceeds the 256 MiB download limit".into());
-    }
-    let actual_sha512 = hex::encode(sha2::Sha512::digest(&bytes));
-    if !actual_sha512.eq_ignore_ascii_case(expected_sha512) {
-        return Err("Downloaded mod failed its SHA-512 integrity check".into());
-    }
     let dest = crate::paths::instances_dir(app)?
         .join(instance_id)
         .join("mods")
         .join(safe_name);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
+    crate::launch::download_verified_file::<sha2::Sha512>(
+        app,
+        session,
+        client,
+        download_url,
+        &dest,
+        expected_sha512,
+        256 * 1024 * 1024,
+    )
+    .await?;
     Ok(dest.to_string_lossy().to_string())
 }
