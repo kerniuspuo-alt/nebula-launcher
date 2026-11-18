@@ -378,10 +378,10 @@ export default function App() {
     // Check immediately on mount
     void checkForUpdates();
 
-    // Re-check every 30 minutes while the app is running ("live" updater)
+    // Re-check every 10 minutes while the app is running ("live" background updater)
     timer = setInterval(() => {
       void checkForUpdates();
-    }, 30 * 60 * 1000);
+    }, 10 * 60 * 1000);
 
     // Also re-check when the window regains focus
     const onFocus = () => void checkForUpdates();
