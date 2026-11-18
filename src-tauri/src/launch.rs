@@ -1588,6 +1588,37 @@ async fn launch_instance_inner(
         args.push("-cp".into());
         args.push(cp);
     }
+
+    // --- Lunar Client-style optimizations ---
+    if inst.lunar_features.fps_boost {
+        args.push("-XX:+UseZGC".into());
+        args.push("-XX:+ZGenerational".into());
+        args.push("-XX:+UnlockExperimentalVMOptions".into());
+        args.push("-XX:+DisableExplicitGC".into());
+        args.push("-XX:+AlwaysPreTouch".into());
+        args.push("-XX:+ParallelRefProcEnabled".into());
+        args.push("-Dsun.rmi.dgc.server.gcInterval=2147483646".into());
+        args.push("-XX:MaxGCPauseMillis=100".into());
+        args.push("-XX:G1HeapRegionSize=32M".into());
+    }
+    if inst.lunar_features.cosmetics {
+        args.push("-Dnebula.cosmetics.enabled=true".into());
+    }
+    if inst.lunar_features.hud_enhancements {
+        args.push("-Dnebula.hud.enabled=true".into());
+    }
+    if inst.lunar_features.replay_mod {
+        args.push("-Dnebula.replay.enabled=true".into());
+    }
+    if inst.lunar_features.pvp_enhancements {
+        args.push("-Dnebula.pvp.enabled=true".into());
+        args.push("-XX:+UseFastAccessorMethods".into());
+    }
+    if inst.lunar_features.shaders {
+        args.push("-Dnebula.shaders.enabled=true".into());
+    }
+    // ----------------------------------------
+
     args.push(main_class.into());
     args.extend(game_arguments(&json, &variables));
     if let Some(host) = server_host {

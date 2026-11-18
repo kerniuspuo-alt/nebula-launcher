@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   Activity,
   Box,
@@ -25,7 +25,6 @@ import {
   X,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
@@ -36,6 +35,7 @@ import {
   type DownloadProgress,
   type Instance,
   type JvmPlan,
+  type LunarFeatures,
   type ModHit,
   type PlaytimeSummary,
   type ScanFinding,
@@ -187,19 +187,6 @@ const TABS: { id: Tab; label: string; icon: typeof Box }[] = [
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
-const ALLOWED_MAC_MACHINE_IDS = [
-  "C948BAB9-A662-57D1-934A-BE7A10F40F37",
-];
-
-async function isMacUpdateAllowed(): Promise<boolean> {
-  try {
-    const machineId = await invoke<string>("get_machine_id");
-    return ALLOWED_MAC_MACHINE_IDS.includes(machineId);
-  } catch {
-    return false;
-  }
-}
-
 export default function App() {
   const [tab, setTab] = useState<Tab>("library");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -233,6 +220,8 @@ export default function App() {
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [updateProgress, setUpdateProgress] = useState("");
   const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [downloadOverlayOpen, setDownloadOverlayOpen] = useState(false);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme === "aurora" ? "" : theme;
@@ -334,6 +323,7 @@ export default function App() {
     setDownloadFiles([]);
     setDownloadStage(null);
     setDownloadsOpen(true);
+    setDownloadOverlayOpen(true);
     return id;
   };
 
@@ -341,6 +331,7 @@ export default function App() {
     if (activeDownloadRef.current === id) activeDownloadRef.current = null;
     setActiveDownloadId((current) => current === id ? null : current);
     setDownloadPaused(false);
+    setDownloadOverlayOpen(false);
   };
 
   const notify = (msg: string) => {
@@ -348,12 +339,23 @@ export default function App() {
     setTimeout(() => setToast(""), 4200);
   };
 
+  const isMacUpdateAllowed = useCallback(async () => {
+    try {
+      await api.system();
+      // Allow updates on all platforms. In a production build you could restrict by os/arch here.
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
   useEffect(() => {
     if (import.meta.env.VITE_TAURI_UPDATER_ENABLED !== "true") return;
 
     let active = true;
+    let timer: ReturnType<typeof setInterval> | null = null;
 
-    void (async () => {
+    const checkForUpdates = async () => {
       try {
         const allowed = await isMacUpdateAllowed();
         if (!allowed) {
@@ -362,17 +364,35 @@ export default function App() {
         }
 
         const update = await check();
-        if (active && update) setAvailableUpdate(update);
-        else if (update) void update.close();
+        if (active && update) {
+          setAvailableUpdate(update);
+          setUpdateModalOpen(true);
+        } else if (update) {
+          void update.close();
+        }
       } catch (error: unknown) {
         if (active) notify(`Could not check for launcher updates: ${String(error)}`);
       }
-    })();
+    };
+
+    // Check immediately on mount
+    void checkForUpdates();
+
+    // Re-check every 30 minutes while the app is running ("live" updater)
+    timer = setInterval(() => {
+      void checkForUpdates();
+    }, 30 * 60 * 1000);
+
+    // Also re-check when the window regains focus
+    const onFocus = () => void checkForUpdates();
+    window.addEventListener("focus", onFocus);
 
     return () => {
       active = false;
+      if (timer) clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
     };
-  }, []);
+  }, [isMacUpdateAllowed]);
 
   const installAvailableUpdate = async () => {
     if (!availableUpdate || installingUpdate) return;
@@ -548,20 +568,17 @@ export default function App() {
         </header>
 
         {availableUpdate && (
-          <div className="glass flex flex-wrap items-center gap-3 px-4 py-3" role="status">
-            <div className="min-w-0 flex-1">
-              <div className="font-medium">Nebula update available · {availableUpdate.version}</div>
-              <div className="text-sm mt-1 whitespace-pre-line" style={{ color: "var(--muted)" }}>
-                {updateProgress || availableUpdate.body || `Version ${availableUpdate.version} is ready to install.`}
-              </div>
-            </div>
+          <div className="flex items-center gap-2 px-3 py-1 rounded-lg bg-white/5 border border-white/10 animate-pulse">
+            <div className="w-2 h-2 rounded-full bg-accent animate-pulse" />
+            <span className="text-xs font-medium" style={{ color: "var(--accent)" }}>
+              Update v{availableUpdate.version} available
+            </span>
             <button
-              className="px-4 py-2 rounded-xl text-sm font-medium"
-              style={{ background: "var(--accent)", color: "#081018" }}
-              disabled={installingUpdate}
-              onClick={() => void installAvailableUpdate()}
+              className="ml-2 w-6 h-6 rounded-full flex items-center justify-center hover:bg-white/10 transition-colors"
+              onClick={() => setUpdateModalOpen(true)}
+              aria-label="View update"
             >
-              {installingUpdate ? "Updating…" : "Restart and Update"}
+              <Package size={14} strokeWidth={2} />
             </button>
           </div>
         )}
@@ -777,6 +794,386 @@ export default function App() {
       {toast && (
         <div className="fixed bottom-5 right-5 glass px-4 py-3 text-sm max-w-sm">{toast}</div>
       )}
+
+      {downloadOverlayOpen && (
+        <DownloadOverlay
+          open={downloadOverlayOpen}
+          onClose={() => setDownloadOverlayOpen(false)}
+          files={downloadFiles}
+          stage={downloadStage}
+          activeDownloadId={activeDownloadId}
+          downloadPaused={downloadPaused}
+          onPauseResume={() => {
+            const operation = downloadPaused
+              ? api.resumeDownload(activeDownloadId ?? "")
+              : api.pauseDownload(activeDownloadId ?? "");
+            operation.then(() => {
+              setDownloadPaused(!downloadPaused);
+              setDownloadFiles((files) => files.map((file) => file.status === "completed"
+                ? file
+                : { ...file, status: downloadPaused ? "downloading" : "paused" }));
+            }).catch((error) => notify(`Could not control download: ${String(error)}`));
+          }}
+          onCancel={() => {
+            api.cancelDownload(activeDownloadId ?? "").then(() => {
+              setDownloadFiles((files) => files.map((file) => file.status === "completed" ? file : { ...file, status: "cancelled" }));
+              setActiveDownloadId(null);
+              setDownloadPaused(false);
+              setDownloadOverlayOpen(false);
+            }).catch((error) => notify(`Could not cancel download: ${String(error)}`));
+          }}
+        />
+      )}
+
+      {availableUpdate && (
+        <UpdateModal
+          open={updateModalOpen}
+          update={availableUpdate}
+          onClose={() => setUpdateModalOpen(false)}
+          onRestartNow={() => void installAvailableUpdate()}
+          onRestartLater={() => setUpdateModalOpen(false)}
+          installing={installingUpdate}
+          progress={updateProgress}
+        />
+      )}
+    </div>
+  );
+}
+
+function DownloadOverlay({
+  open,
+  onClose,
+  files,
+  stage,
+  activeDownloadId,
+  downloadPaused,
+  onPauseResume,
+  onCancel,
+}: {
+  open: boolean;
+  onClose: () => void;
+  files: DownloadProgress[];
+  stage: { stage: string; current: number; total: number; detail: string } | null;
+  activeDownloadId: string | null;
+  downloadPaused: boolean;
+  onPauseResume: () => void;
+  onCancel: () => void;
+}) {
+  if (!open) return null;
+
+  const totalBytes = files.reduce((sum, f) => sum + f.totalBytes, 0);
+  const downloadedBytes = files.reduce((sum, f) => sum + f.downloadedBytes, 0);
+  const overallPercent = totalBytes > 0 ? Math.round((downloadedBytes / totalBytes) * 100) : 0;
+  const avgSpeed = files.reduce((sum, f) => sum + f.speedBytesPerSecond, 0);
+  const speedText = avgSpeed > 0 ? `${(avgSpeed / 1024 / 1024).toFixed(1)} MB/s` : "";
+
+  return (
+    <div className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-sm flex items-center justify-center" onClick={onClose}>
+      <div className="glass w-full max-w-lg p-0 rounded-2xl border border-white/10 shadow-2xl overflow-hidden flex flex-col" onClick={(e) => e.stopPropagation()}>
+        <div className="p-6 border-b border-white/5 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <Download className="w-6 h-6" style={{ color: "var(--accent)" }} />
+            <h2 className="text-lg font-semibold">Installing Mods & Files</h2>
+          </div>
+          <button
+            className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-white/5 transition-colors"
+            onClick={onClose}
+            aria-label="Close download"
+          >
+            <X size={18} strokeWidth={2} />
+          </button>
+        </div>
+
+        <div className="p-6">
+          <div className="mb-4">
+            <div className="flex justify-between text-sm mb-1">
+              <span className="font-medium">{overallPercent}%</span>
+              <span className="text-xs" style={{ color: "var(--muted)" }}>{speedText}</span>
+            </div>
+            <div className="h-2 bg-white/10 rounded-full overflow-hidden">
+              <div className="h-full bg-gradient-to-r from-accent2 to-accent transition-all duration-300" style={{ width: `${overallPercent}%` }} />
+            </div>
+          </div>
+
+          {stage && (
+            <div className="mb-4 p-3 rounded-xl bg-white/5 border border-white/5">
+              <div className="text-xs font-medium mb-1" style={{ color: "var(--muted)" }}>{stage.stage}</div>
+              <div className="text-sm">{stage.detail}</div>
+            </div>
+          )}
+
+          <div className="space-y-2">
+            {files.length > 0 ? (
+              files.map((file) => {
+                const percent = file.totalBytes > 0 ? Math.min(100, Math.round((file.downloadedBytes / file.totalBytes) * 100)) : file.status === "completed" ? 100 : 0;
+                const statusColor = file.status === "completed" ? "var(--ok)" : file.status === "failed" ? "var(--danger)" : file.status === "paused" ? "var(--muted)" : "var(--accent)";
+                return (
+                  <div key={file.fileId} className="group">
+                    <div className="flex items-center justify-between text-sm mb-1">
+                      <span className="truncate flex-1 pr-2" title={file.fileName}>{file.fileName}</span>
+                      <span className="text-xs w-12 text-right" style={{ color: statusColor }}>
+                        {file.status === "completed" ? "Done" : file.status === "failed" ? "Failed" : file.status === "paused" ? "Paused" : `${percent}%`}
+                      </span>
+                    </div>
+                    <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
+                      <div className="h-full" style={{ width: `${percent}%`, backgroundColor: statusColor, transition: "width 300ms" }} />
+                    </div>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="text-sm text-muted-foreground text-center py-4">No active files.</div>
+            )}
+          </div>
+        </div>
+
+        {activeDownloadId && (
+          <div className="p-5 border-t border-white/5 flex gap-2">
+            <button
+              className="flex-1 px-4 py-2 rounded-xl text-sm font-medium transition-colors"
+              style={{
+                border: "1px solid var(--stroke)",
+                background: "color-mix(in srgb, var(--bg1) 76%, transparent)",
+                color: "var(--text)",
+              }}
+              onClick={onPauseResume}
+              disabled={files.every((f) => f.status === "completed" || f.status === "failed" || f.status === "cancelled")}
+            >
+              {downloadPaused ? "Resume" : "Pause"}
+            </button>
+            <button
+              className="flex-1 px-4 py-2 rounded-xl text-sm font-medium transition-colors"
+              style={{
+                border: "1px solid color-mix(in srgb, var(--danger) 50%, var(--stroke))",
+                background: "transparent",
+                color: "var(--danger)",
+              }}
+              onClick={onCancel}
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function UpdateModal({
+  open,
+  update,
+  onClose,
+  onRestartNow,
+  onRestartLater,
+  installing,
+  progress,
+}: {
+  open: boolean;
+  update: Update | null;
+  onClose: () => void;
+  onRestartNow: () => void;
+  onRestartLater: () => void;
+  installing: boolean;
+  progress: string;
+}) {
+  if (!open || !update) return null;
+
+  return (
+    <div className="fixed inset-0 z-[100] bg-black/70 backdrop-blur-sm flex items-center justify-center" onClick={onClose}>
+      <div className="glass w-full max-w-md p-0 rounded-2xl border border-white/10 shadow-2xl overflow-hidden flex flex-col" onClick={(e) => e.stopPropagation()}>
+        <div className="p-6 border-b border-white/5 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <Package className="w-7 h-7" style={{ color: "var(--accent)" }} />
+            <h2 className="text-lg font-semibold">Update Required</h2>
+          </div>
+          <button
+            className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-white/5 transition-colors"
+            onClick={onRestartLater}
+            aria-label="Restart later"
+          >
+            <X size={18} strokeWidth={2} />
+          </button>
+        </div>
+
+        <div className="p-6">
+          <div className="mb-4">
+            <div className="text-xs font-medium mb-1" style={{ color: "var(--muted)" }}>Nebula Launcher</div>
+            <div className="text-sm font-medium">Version {update.version} is available</div>
+            <div className="text-xs mt-1" style={{ color: "var(--muted)" }}>
+              Current version: {import.meta.env.VITE_APP_VERSION ?? "0.1.3"}
+            </div>
+          </div>
+
+          {update.body && (
+            <div className="mb-6 p-3 rounded-xl bg-white/5 border border-white/5 text-sm">
+              <div className="text-xs font-medium mb-1" style={{ color: "var(--muted)" }}>What's new</div>
+              <div className="whitespace-pre-wrap line-clamp-3">{update.body}</div>
+            </div>
+          )}
+
+          {installing ? (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between text-sm">
+                <span>Installing update…</span>
+                <span style={{ color: "var(--muted)" }}>{progress}</span>
+              </div>
+              <div className="h-2 bg-white/10 rounded-full overflow-hidden w-full">
+                <div className="h-full bg-gradient-to-r from-accent2 to-accent" style={{ width: "100%" }} />
+              </div>
+            </div>
+          ) : null}
+
+          <div className="pt-4 flex gap-3">
+            <button
+              className="flex-1 px-4 py-3 rounded-xl text-sm font-medium transition-colors"
+              style={{
+                border: "1px solid var(--stroke)",
+                background: "color-mix(in srgb, var(--bg1) 76%, transparent)",
+                color: "var(--text)",
+              }}
+              disabled={installing}
+              onClick={onRestartLater}
+            >
+              {installing ? "Installing…" : "Restart Later"}
+            </button>
+            <button
+              className="flex-1 px-4 py-3 rounded-xl text-sm font-medium transition-colors"
+              style={{
+                background: "var(--accent)",
+                color: "#081018",
+                boxShadow: "0 3px 14px color-mix(in srgb, var(--accent) 20%, transparent)",
+              }}
+              disabled={installing}
+              onClick={onRestartNow}
+            >
+              {installing ? "Updating…" : "Restart Now"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const LUNAR_FEATURE_MODS: Record<keyof LunarFeatures, string[]> = {
+  fpsBoost: ["sodium", "lithium", "entity-culling", "dynamic-fps", "modernfix", "ferrite-core"],
+  cosmetics: [],
+  hudEnhancements: ["betterf3", "xaeros-minimap"],
+  replayMod: [],
+  pvpEnhancements: [],
+  shaders: ["iris", "oculus"],
+};
+
+const LUNAR_FEATURE_DESCRIPTIONS: Record<keyof LunarFeatures, { title: string; desc: string; icon: React.ElementType }> = {
+  fpsBoost: {
+    title: "FPS Boost",
+    desc: "Sodium, Lithium, Entity Culling, Dynamic FPS, ModernFix — maximum performance like Lunar Client",
+    icon: Sparkles,
+  },
+  cosmetics: {
+    title: "Cosmetics",
+    desc: "Capes, emotes, and cosmetic items — show off your style in-game",
+    icon: Package,
+  },
+  hudEnhancements: {
+    title: "HUD Enhancements",
+    desc: "BetterF3, Xaero's Minimap — enhanced in-game information overlay",
+    icon: Globe,
+  },
+  replayMod: {
+    title: "Replay Mod",
+    desc: "Record and replay your Minecraft gameplay",
+    icon: Activity,
+  },
+  pvpEnhancements: {
+    title: "PvP Enhancements",
+    desc: "PvP-focused optimizations and utilities",
+    icon: Crosshair,
+  },
+  shaders: {
+    title: "Shaders",
+    desc: "Iris or Oculus shader support for beautiful graphics",
+    icon: Waves,
+  },
+};
+
+function LunarFeaturesPanel({
+  features,
+  onChange,
+}: {
+  features: LunarFeatures;
+  onChange: (features: LunarFeatures) => void;
+}) {
+  const handleToggle = (key: keyof LunarFeatures) => {
+    onChange({ ...features, [key]: !features[key] });
+  };
+
+  return (
+    <div className="glass p-6 rounded-2xl border border-white/10 space-y-6">
+      <div className="flex items-center gap-3 mb-2">
+        <Package className="w-6 h-6" style={{ color: "var(--accent)" }} />
+        <h3 className="text-lg font-semibold">Lunar Client Features</h3>
+        <span className="ml-auto text-xs font-medium" style={{ color: "var(--muted)" }}>
+          Applied at launch
+        </span>
+      </div>
+      <p className="text-sm text-muted-foreground">
+        Enable Lunar Client-style features. Mods are installed automatically when you save the instance.
+      </p>
+      <div className="space-y-3">
+        {(Object.keys(LUNAR_FEATURE_DESCRIPTIONS) as (keyof LunarFeatures)[]).map((key) => {
+          const info = LUNAR_FEATURE_DESCRIPTIONS[key];
+          const mods = LUNAR_FEATURE_MODS[key];
+          const enabled = features[key];
+          return (
+            <div
+              key={key}
+              className={`group flex items-center justify-between p-3 rounded-xl border transition-all duration-200 ${
+                enabled
+                  ? "border-accent/30 bg-accent/5"
+                  : "border-white/5 bg-white/5"
+              }`}
+            >
+              <div className="flex items-center gap-3 flex-1">
+                <div className="w-9 h-9 rounded-lg flex items-center justify-center" style={{ background: "color-mix(in srgb, var(--accent) 20%, transparent)" }}>
+                  <info.icon size={18} style={{ color: "var(--accent)" }} />
+                </div>
+                <div>
+                  <div className="font-medium" style={{ color: enabled ? "var(--accent)" : "var(--text)" }}>
+                    {info.title}
+                  </div>
+                  <div className="text-xs" style={{ color: "var(--muted)" }}>
+                    {info.desc}
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="text-xs" style={{ color: "var(--muted)" }}>
+                  {mods.length > 0 ? `${mods.length} mod${mods.length > 1 ? "s" : ""}` : "Feature only"}
+                </div>
+                <button
+                  role="switch"
+                  aria-checked={enabled}
+                  className={`relative inline-flex w-11 h-6 shrink-0 cursor-pointer rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 ${
+                    enabled ? "bg-accent" : "bg-white/10 border border-white/10"
+                  }`}
+                  onClick={() => handleToggle(key)}
+                  aria-label={enabled ? `Disable ${info.title}` : `Enable ${info.title}`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      enabled ? "translate-x-6" : "translate-x-1"
+                    }`}
+                  />
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="pt-2 text-xs text-muted-foreground">
+        Features apply JVM arguments and install mods when Minecraft launches. Requires Fabric/Quilt/Forge/NeoForge loader.
+      </div>
     </div>
   );
 }
@@ -807,6 +1204,14 @@ function Library({
   const [ver, setVer] = useState("1.21.1");
   const [loader, setLoader] = useState("fabric");
   const [plan, setPlan] = useState<JvmPlan | null>(null);
+  const [lunarFeatures, setLunarFeatures] = useState<LunarFeatures>({
+    fpsBoost: false,
+    cosmetics: false,
+    hudEnhancements: false,
+    replayMod: false,
+    pvpEnhancements: false,
+    shaders: false,
+  });
   const current = instances.find((i) => i.id === selected);
 
   useEffect(() => {
@@ -865,6 +1270,7 @@ function Library({
               { value: "vanilla", label: "Vanilla" },
             ]}
           />
+          <LunarFeaturesPanel features={lunarFeatures} onChange={setLunarFeatures} />
           <button
             className="accent-button w-full py-2.5 rounded-xl font-medium"
             onClick={async () => {
@@ -874,6 +1280,7 @@ function Library({
                 minecraftVersion: ver,
                 loader,
                 profile: loader === "fabric" ? "sodium-iris" : "balanced",
+                lunarFeatures,
               });
               await onRefresh();
               notify("Instance created");
@@ -1870,24 +2277,68 @@ function Spotify({ onEnergy, notify }: { onEnergy: (n: number) => void; notify: 
       <p className="text-sm mt-2" style={{ color: "var(--muted)" }}>
         Official Spotify Web Playback SDK. Premium is required for in-app audio; Spotify handles the stream.
       </p>
-      <div className="flex flex-wrap gap-2 mt-3">
-        <button className="px-4 py-2 rounded-xl" style={{ background: "var(--accent)", color: "#081018" }} onClick={() => void connectSpotify()}>
-          {token ? "Reconnect Spotify" : "Connect Spotify"}
-        </button>
-        {token && <button className="px-4 py-2 rounded-xl" style={{ border: "1px solid var(--stroke)" }} onClick={async () => {
-          playerRef.current?.disconnect();
-          playerRef.current = null;
-          await api.spotifyDisconnect();
-          setToken("");
-          setSpotifyProfile(null);
-          setPlayback(null);
-          setTracks([]);
-          notify("Spotify disconnected");
-        }}>Disconnect</button>}
-        <span className="text-sm self-center" style={{ color: deviceId ? "var(--ok)" : "var(--muted)" }}>
-          {token ? (deviceId ? "Connected · player ready" : "Connected · starting player…") : "Not connected"}
-        </span>
-      </div>
+      {!token && !spotifyProfile && (
+        <div className="mt-4 glass p-6 rounded-2xl border border-white/10 text-center space-y-4">
+          <div className="flex flex-col items-center gap-3">
+            <div className="w-16 h-16 rounded-2xl flex items-center justify-center" style={{ background: "linear-gradient(135deg, #1ed760, #1aa34a)" }}>
+              <Music2 size={32} style={{ color: "#081018" }} />
+            </div>
+            <h3 className="text-lg font-semibold">Connect Spotify</h3>
+            <p className="text-sm text-muted-foreground max-w-md mx-auto">
+              Log in to Spotify to play music, browse your playlists, and use the DJ features inside Nebula Launcher.
+            </p>
+          </div>
+          <button
+            className="w-full py-3.5 rounded-xl font-semibold text-sm tracking-wide flex items-center justify-center gap-2"
+            style={{ background: "#1ed760", color: "#081018", boxShadow: "0 4px 14px rgba(30, 215, 96, 0.35)" }}
+            onClick={() => void connectSpotify()}
+            disabled={!configuredClientId}
+          >
+            {configuredClientId ? (
+              <>
+                <Music2 size={16} /> Log in with Spotify
+              </>
+            ) : (
+              "Spotify not configured"
+            )}
+          </button>
+          {!configuredClientId && (
+            <p className="text-xs text-muted-foreground">
+              The app publisher must set <code className="font-mono text-xs">VITE_SPOTIFY_CLIENT_ID</code> to enable Spotify login.
+            </p>
+          )}
+        </div>
+      )}
+      {token && (
+        <div className="mt-4 flex flex-wrap gap-2 items-center">
+          <button
+            className="px-4 py-2 rounded-xl font-medium"
+            style={{ background: "var(--accent)", color: "#081018" }}
+            onClick={() => void connectSpotify()}
+          >
+            Reconnect Spotify
+          </button>
+          <button
+            className="px-4 py-2 rounded-xl font-medium"
+            style={{ border: "1px solid var(--stroke)" }}
+            onClick={async () => {
+              playerRef.current?.disconnect();
+              playerRef.current = null;
+              await api.spotifyDisconnect();
+              setToken("");
+              setSpotifyProfile(null);
+              setPlayback(null);
+              setTracks([]);
+              notify("Spotify disconnected");
+            }}
+          >
+            Disconnect
+          </button>
+          <span className="text-sm self-center" style={{ color: deviceId ? "var(--ok)" : "var(--muted)" }}>
+            {deviceId ? "Connected · player ready" : "Connected · starting player…"}
+          </span>
+        </div>
+      )}
       {spotifyProfile && (
         <div className="mt-4 flex items-center gap-3 p-3 rounded-xl" style={{ border: "1px solid var(--stroke)" }}>
           {spotifyProfile.imageUrl ? (

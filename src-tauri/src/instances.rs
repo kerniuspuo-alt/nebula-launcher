@@ -5,6 +5,23 @@ use uuid::Uuid;
 
 use crate::paths;
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LunarFeatures {
+    #[serde(default)]
+    pub fps_boost: bool,
+    #[serde(default)]
+    pub cosmetics: bool,
+    #[serde(default)]
+    pub hud_enhancements: bool,
+    #[serde(default)]
+    pub replay_mod: bool,
+    #[serde(default)]
+    pub pvp_enhancements: bool,
+    #[serde(default)]
+    pub shaders: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Instance {
@@ -15,6 +32,8 @@ pub struct Instance {
     #[serde(default)]
     pub loader_version: Option<String>,
     pub profile: String,
+    #[serde(default)]
+    pub lunar_features: LunarFeatures,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
@@ -64,6 +83,10 @@ fn default_instances() -> Vec<Instance> {
             loader: "fabric".into(),
             loader_version: None,
             profile: "sodium-iris".into(),
+            lunar_features: LunarFeatures {
+                fps_boost: true,
+                ..Default::default()
+            },
             created_at: Utc::now().to_rfc3339(),
             last_played: None,
             playtime_seconds: 0,
@@ -75,6 +98,7 @@ fn default_instances() -> Vec<Instance> {
             loader: "vanilla".into(),
             loader_version: None,
             profile: "balanced".into(),
+            lunar_features: LunarFeatures::default(),
             created_at: Utc::now().to_rfc3339(),
             last_played: None,
             playtime_seconds: 0,
@@ -86,6 +110,10 @@ fn default_instances() -> Vec<Instance> {
             loader: "vanilla".into(),
             loader_version: None,
             profile: "optifine-legacy".into(),
+            lunar_features: LunarFeatures {
+                pvp_enhancements: true,
+                ..Default::default()
+            },
             created_at: Utc::now().to_rfc3339(),
             last_played: None,
             playtime_seconds: 0,

@@ -25,6 +25,15 @@ export type JvmPlan = {
   matched: JavaRuntime | null;
 };
 
+export type LunarFeatures = {
+  fpsBoost: boolean;
+  cosmetics: boolean;
+  hudEnhancements: boolean;
+  replayMod: boolean;
+  pvpEnhancements: boolean;
+  shaders: boolean;
+};
+
 export type Instance = {
   id: string;
   name: string;
@@ -32,6 +41,7 @@ export type Instance = {
   loader: string;
   loaderVersion?: string | null;
   profile: string;
+  lunarFeatures: LunarFeatures;
   createdAt: string;
   lastPlayed?: string | null;
   playtimeSeconds: number;
