@@ -24,15 +24,14 @@ import {
   Waves,
   X,
 } from "lucide-react";
+import { type Account, type CuratedServer, type DownloadProgress } from "./api";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { interpretDj } from "./dj";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   api,
-  type Account,
-  type CuratedServer,
-  type DownloadProgress,
   type Instance,
   type JvmPlan,
   type LunarFeatures,
@@ -46,7 +45,7 @@ import {
   type VersionInfo,
   type WorldSave,
 } from "./api";
-import { interpretDj } from "./dj";
+
 
 type Tab =
   | "library"
@@ -56,7 +55,12 @@ type Tab =
   | "studio"
   | "profiler"
   | "vault"
+  | "customization"
   | "settings";
+
+
+
+
 
 type ThemePalette = {
   accent: string;
@@ -185,7 +189,10 @@ const TABS: { id: Tab; label: string; icon: typeof Box }[] = [
   { id: "profiler", label: "Profiler", icon: Activity },
   { id: "vault", label: "Vault", icon: Disc3 },
   { id: "settings", label: "Settings", icon: Settings },
+  
+
 ];
+
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("library");
@@ -2638,6 +2645,17 @@ function SettingsView({
       .then((runtimes) => setJavaPath(runtimes.find((runtime) => runtime.major === 21)?.path ?? ""))
       .catch((error) => notify(`Could not discover Java runtimes: ${String(error)}`));
   }, []);
+
+// Listen for update-available event from Tauri auto-updater
+  useEffect(() => {
+    const handleUpdateAvailable = (event: any, data: { latest_version: string; download_url: string }) => {
+      notify(`Update available: ${data.latest_version}. Click to install.`);
+      // Optionally auto-download or just notify
+    };
+    const unsub = listen("update-available", handleUpdateAvailable);
+    return () => unsub();
+  }, []);
+
   const exportTheme = () => {
     const blob = new Blob([JSON.stringify({ schemaVersion: 1, name: themeName, theme, palette, motionBlur }, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
@@ -2712,7 +2730,8 @@ function SettingsView({
                   if (!window.confirm(`Remove ${savedAccount.name} from Nebula?`)) return;
                   try {
                     await api.removeAccount(savedAccount.uuid);
-                    const [nextAccounts, activeAccount] = await Promise.all([api.accounts(), api.activeAccount()]);
+const nextAccounts = await api.accounts();
+    const activeAccount = await api.activeAccount();
                     setAccounts(nextAccounts);
                     setAccount(activeAccount);
                     notify(`Removed ${savedAccount.name}`);
