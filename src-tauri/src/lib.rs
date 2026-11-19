@@ -1,3 +1,4 @@
+use tauri::Emitter;
 mod auth;
 mod instances;
 mod jvm;
