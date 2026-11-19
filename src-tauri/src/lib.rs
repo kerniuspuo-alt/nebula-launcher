@@ -35,22 +35,21 @@ pub fn run() {
                 eprintln!("Could not start Spotify callback listener: {error}");
             }
 
-            // Start background auto-update checker (every 10 minutes)
-            let app_handle = app.handle().clone();
-            tokio::spawn(async move {
-                let mut interval = interval(std::time::Duration::from_secs(600)); // 10 minutes
-                loop {
-                    interval.tick().await;
-                    // Check for updates silently in the background
-                    if let Ok(Some(update)) = tauri_plugin_updater::updater(&app_handle).check().await {
-                        // Emit event to frontend about available update
-                        let _ = app_handle.emit("update-available", serde_json::json!({
-                            "latest_version": update.version(),
-                            "download_url": update.download_url(),
-                        }));
-                    }
-                }
-            });
+ // // Start background auto-update checker (every 10 minutes)
+// let app_handle = app.handle().clone();
+// tokio::spawn(async move {
+//     let mut interval = interval(std::time::Duration::from_secs(600)); // 10 minutes
+//     loop {
+//         interval.tick().await;
+//         // Check for updates silently in the background
+//         // if let Ok(Some(update)) = tauri_plugin_updater::updater(&app_handle).check().await {
+//         //     let _ = app_handle.emit("update-available", serde_json::json!({
+//         //         "latest_version": update.version(),
+//         //         "download_url": update.download_url(),
+//         //     }));
+//         // }
+//     }
+// });
 
             Ok(())
         })
