@@ -15,7 +15,7 @@ const DEFAULT_STATE: CustomizationState = {
 };
 
 export const CustomizationView = () => {
-  const [state, setState] = useState<CustomizationState>(DEFAULT_STATE);
+  
   useEffect(() => {
     console.log("CustomizationView loaded");
   }, []);
