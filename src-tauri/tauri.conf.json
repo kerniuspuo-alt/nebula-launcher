@@ -38,13 +38,8 @@
       "icons/icon.ico"
     ]
   },
-  "plugins": {
-    "updater": {
-      "active": false,
-      
-      "endpoints": [
-        "https://github.com/kerniuspuo-alt/nebula-launcher/releases/latest/download/latest.json"
-      ],
+  "
+
       "requireSignedVersion": true,
       "dangerousInsecureTransportProtocol": false
     }
