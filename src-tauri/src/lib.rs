@@ -19,6 +19,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                // Hide window instead of quitting so the update checker keeps running in the background
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             paths::initialize(app.handle())?;
             if let Err(error) = overlay::start(app.handle().clone()) {
@@ -27,6 +33,24 @@ pub fn run() {
             if let Err(error) = spotify::start(app.handle().clone()) {
                 eprintln!("Could not start Spotify callback listener: {error}");
             }
+
+            // Start background auto-update checker (every 10 minutes)
+            let app_handle = app.handle().clone();
+            tokio::spawn(async move {
+                let mut interval = interval(std::time::Duration::from_secs(600)); // 10 minutes
+                loop {
+                    interval.tick().await;
+                    // Check for updates silently in the background
+                    if let Ok(Some(update)) = tauri_plugin_updater::updater(&app_handle).check().await {
+                        // Emit event to frontend about available update
+                        let _ = app_handle.emit("update-available", serde_json::json!({
+                            "latest_version": update.version(),
+                            "download_url": update.download_url(),
+                        }));
+                    }
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
