@@ -40,8 +40,8 @@
   },
   "plugins": {
     "updater": {
-      "active": true,
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IHJzaWduIGVuY3J5cHRlZCBzZWNyZXQga2V5ClJXUlRZMEl5M2tnZzNqcElPZ2IzOWhMUkNHdzJWWEZLVUhWRUQ1VlJ2bms2NGl3aHE2SUFBQkFBQUFBQUFBQUFBQUlBQUFBQTZ4dWJtYmo1VGFJMWoyZVpxWkZJei9ZRmlzQ1Zjcms5eVdxeDcyanY0NjBIbWxadWd3cUVmU1pNN0Z2Skk0VE1uMFFsQ3A2UkZZV0NpcC9jTEVMeGdpd0YwaW1hNy9hQ2RLMVF6KzlIR29OdnBzd0FqV1IvSVRUbk5FZllhQkg2UExaQ2tKSGJrTHc9Cg==",
+      "active": false,
+      
       "endpoints": [
         "https://github.com/kerniuspuo-alt/nebula-launcher/releases/latest/download/latest.json"
       ],
