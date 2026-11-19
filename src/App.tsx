@@ -2648,7 +2648,7 @@ function SettingsView({
 
 // Listen for update-available event from Tauri auto-updater
   useEffect(() => {
-    const handleUpdateAvailable = (event: any, data: { latest_version: string; download_url: string }) => {
+handleUpdateAvailable = (_event: any, data: { latest_version: string; download_url: string }) => {
       notify(`Update available: ${data.latest_version}. Click to install.`);
       // Optionally auto-download or just notify
     };
