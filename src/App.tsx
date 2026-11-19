@@ -2646,15 +2646,23 @@ function SettingsView({
       .catch((error) => notify(`Could not discover Java runtimes: ${String(error)}`));
   }, []);
 
-// Listen for update-available event from Tauri auto-updater
-  useEffect(() => {
-handleUpdateAvailable = (_event: any, data: { latest_version: string; download_url: string }) => {
-      notify(`Update available: ${data.latest_version}. Click to install.`);
-      // Optionally auto-download or just notify
-    };
-    const unsub = listen("update-available", handleUpdateAvailable);
-    return () => unsub();
-  }, []);
+const handleUpdateAvailable = (_event: any, data: { latest_version: string }) => {
+  notify(`Update available: ${data.latest_version}`);
+};
+
+useEffect(() => {
+  let unlisten: (() => void) | undefined;
+  
+  listen("update-available", (event) => {
+    handleUpdateAvailable(event, event.payload as any);
+  }).then((unsubFn) => {
+    unlisten = unsubFn;
+  });
+
+  return () => {
+    if (unlisten) unlisten();
+  };
+}, []);
 
   const exportTheme = () => {
     const blob = new Blob([JSON.stringify({ schemaVersion: 1, name: themeName, theme, palette, motionBlur }, null, 2)], { type: "application/json" });
